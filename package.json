@@ -1,6 +1,6 @@
 {
   "name": "bulletgrounds",
-  "version": "0.1.23",
+  "version": "0.1.24",
   "private": true,
   "author": "Joulio224",
   "type": "module",
@@ -17,7 +17,8 @@
     "electron-updater": "^6.6.2",
     "firebase": "^11.8.1",
     "socket.io-client": "^4.8.3",
-    "three": "^0.169.0"
+    "three": "^0.169.0",
+    "three-mesh-bvh": "^0.8.3"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

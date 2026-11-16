@@ -179,6 +179,9 @@ export const GRENADE_STEP = 1 / 60;
 
 function grenadeCollides(boxes, x, y, z) {
   const r = GRENADE_RADIUS;
+  // Collisions précises (triangles réels de map-colliders.glb, voir
+  // collision-world.js) : `boxes` est alors le monde de collision lui-même.
+  if (typeof boxes.collidesSphere === 'function') return boxes.collidesSphere(x, y, z, r);
   for (let i = 0; i < boxes.length; i++) {
     const b = boxes[i];
     if (

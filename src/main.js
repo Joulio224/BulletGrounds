@@ -65,6 +65,7 @@ import { createAmbiance } from './ambiance.js';
 import { createFx } from './fx.js';
 import { createHudFx } from './hudfx.js';
 import { computeMapOffsetY, disableTallWallShadows } from './map-align.js';
+import { createCollisionWorld } from './collision-world.js';
 import { initGameAdminPanel } from './game-admin.js';
 // Toutes les données de la map qui ne sont pas de la géométrie visuelle pure
 // (boîtes de collision, spawns d'équipe, lumières d'ambiance) — doit rester identique à
@@ -176,6 +177,10 @@ const playButton = document.getElementById('play-button');
 
 const collisionMeshes = [];
 const collisionBoxes = [];
+// Collisions PRÉCISES : tous les triangles de map-colliders.glb dans un BVH
+// (three-mesh-bvh). C'est lui qui gère déplacement, tirs et grenades ; les
+// boîtes ci-dessus ne servent plus qu'à la minimap.
+let collisionWorld = null;
 
 let mapLoaded = false;
 let collidersLoaded = false;
@@ -326,9 +331,16 @@ mapLoader.load(
       return;
     }
 
+    try {
+      collisionWorld = createCollisionWorld(gltf.scene);
+    } catch (error) {
+      showMapError('Impossible de construire les collisions précises de map-colliders.glb.', error);
+      return;
+    }
+
     collidersLoaded = true;
     console.info(
-      `[MAP-COLLIDERS] Collisions chargées : ${meshCount} mesh(s), ${collisionBoxes.length} boîte(s), ${invalidCount} mesh(s) invalide(s).`
+      `[MAP-COLLIDERS] Collisions chargées : ${meshCount} mesh(s), ${collisionWorld.triangleCount} triangle(s) (BVH), ${invalidCount} mesh(s) invalide(s).`
     );
 
     enableGameIfReady();
@@ -1432,54 +1444,35 @@ function getGroundY(x, z) {
   return y;
 }
 
-// Collision horizontale simple (cercle contre boîte, résolu axe par axe pour
-// pouvoir glisser le long d'un mur au lieu de se bloquer net dessus).
+// Collision horizontale : un cylindre (le joueur) contre les TRIANGLES réels de
+// map-colliders.glb (voir collision-world.js). Le joueur glisse le long des murs
+// et passe par les ouvertures des bâtiments, ce que les anciennes boîtes
+// englobantes (une Box3 par mesh) bouchaient.
 const PLAYER_RADIUS = 0.4;
-const FLAT_PLATE_MAX_THICKNESS = 0.2; // en dessous : décor plat, ignoré par les collisions
 const STEP_HEIGHT = 0.35; // hauteur max franchie sans collision (les plaques de spawn font 0,3 m)
 
-function collidesAt(x, z) {
-  if (collisionBoxes.length === 0) return false;
-
-  // Le corps va des PIEDS au sommet de la tête. Les pieds se déduisent de la
-  // hauteur d'yeux ACTUELLE (1,7 m debout, 1,0 accroupi, 0,8 en glissade) : avec
-  // une valeur fixe de 1,7 m, un joueur accroupi avait ses "pieds" calculés
-  // 0,7 m sous terre, donc dans la boîte de collision du sol (qui couvre toute
-  // la map) : il était bloqué de tous côtés, comme enfoncé dans le sol.
+// Tranche de hauteur occupée par le corps, des PIEDS (+ une marche) au sommet de
+// la tête. Les pieds se déduisent de la hauteur d'yeux ACTUELLE (1,7 m debout,
+// 1,0 accroupi, 0,8 en glissade), pas d'une valeur fixe.
+function playerBodyBand() {
   const eyeY = camera.position.y;
-  const playerMinY = eyeY - currentEyeHeight;
-  const playerMaxY = eyeY - 0.15;
+  return { yMin: eyeY - currentEyeHeight + STEP_HEIGHT, yMax: eyeY - 0.15 };
+}
 
-  for (const box of collisionBoxes) {
-    // On ignore ce qui est entièrement au-dessus de la tête, ou qui ne dépasse
-    // pas la hauteur d'une marche au-dessus des pieds : sol, plaques de spawn
-    // (0,3 m), petits rebords. Ils ne sont pas des murs : le sol visible suit
-    // ces reliefs (voir getGroundY) et le joueur monte dessus.
-    if (box.max.y <= playerMinY + STEP_HEIGHT || box.min.y >= playerMaxY) continue;
-    // Plaque plate (moins de 20 cm d'épaisseur) : un décor posé sur le sol, comme
-    // les motifs des zones de départ (7 cm d'épaisseur, 7 m de côté) — pas un mur.
-    // Sans ça, on apparaissait coincé au milieu de sa zone de départ.
-    if (box.max.y - box.min.y < FLAT_PLATE_MAX_THICKNESS) continue;
-
-    // Circle (player) versus axis-aligned box, in the horizontal plane.
-    const closestX = THREE.MathUtils.clamp(x, box.min.x, box.max.x);
-    const closestZ = THREE.MathUtils.clamp(z, box.min.z, box.max.z);
-    const dx = x - closestX;
-    const dz = z - closestZ;
-    if (dx * dx + dz * dz < PLAYER_RADIUS * PLAYER_RADIUS) return true;
-  }
-
-  return false;
+function collidesAt(x, z) {
+  if (!collisionWorld) return false;
+  const { yMin, yMax } = playerBodyBand();
+  return collisionWorld.collidesCylinder(x, z, yMin, yMax, PLAYER_RADIUS);
 }
 
 function resolveHorizontalCollisions(prevX, prevZ) {
-  if (adminState.noclip) return;
-  if (collidesAt(camera.position.x, prevZ)) {
-    camera.position.x = prevX;
-  }
-  if (collidesAt(camera.position.x, camera.position.z)) {
-    camera.position.z = prevZ;
-  }
+  if (adminState.noclip || !collisionWorld) return;
+  const { yMin, yMax } = playerBodyBand();
+  const result = collisionWorld.slideMove(
+    prevX, prevZ, camera.position.x, camera.position.z, yMin, yMax, PLAYER_RADIUS
+  );
+  camera.position.x = result.x;
+  camera.position.z = result.z;
 }
 
 function onKeyChange(e, isDown) {
@@ -1865,6 +1858,8 @@ document.addEventListener('keydown', (e) => {
 // des grenades soit calculé exactement comme là-bas (voir stepGrenade).
 let grenadeBoxCache = { boxes: [], count: -1 };
 function getGrenadeBoxes() {
+  // Collisions précises : le monde de collision lui-même (même physique que le serveur).
+  if (collisionWorld) return collisionWorld;
   if (grenadeBoxCache.count !== collisionBoxes.length) {
     grenadeBoxCache = {
       count: collisionBoxes.length,
@@ -2356,7 +2351,22 @@ const BODY_SPHERES = [[0.45, 0.38], [1.1, 0.4], [1.65, 0.27]]; // [hauteur depui
 const _oc = new THREE.Vector3();
 function traceStraight(origin, dir, maxDist = DEFAULT_RANGE, ignoreId = null) {
   const result = { distance: maxDist, kind: null, point: new THREE.Vector3(), normal: new THREE.Vector3() };
-  if (collisionMeshes.length > 0) {
+  if (collisionWorld) {
+    // Rayon sur les triangles réels (BVH), comme côté serveur : les tirs passent
+    // par les ouvertures des bâtiments et s'arrêtent sur les vrais murs.
+    const hit = collisionWorld.raycastFirst(origin.x, origin.y, origin.z, dir.x, dir.y, dir.z, maxDist);
+    if (hit) {
+      result.distance = hit.distance;
+      result.kind = 'surface';
+      result.point.copy(hit.point);
+      if (hit.normal) {
+        result.normal.copy(hit.normal);
+        if (result.normal.dot(dir) > 0) result.normal.negate(); // face tournée vers le tireur
+      } else {
+        result.normal.copy(dir).negate();
+      }
+    }
+  } else if (collisionMeshes.length > 0) {
     shotRaycaster.set(origin, dir);
     shotRaycaster.near = 0;
     shotRaycaster.far = maxDist;
