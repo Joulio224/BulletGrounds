@@ -66,6 +66,7 @@ import { createFx } from './fx.js';
 import { createHudFx } from './hudfx.js';
 import { computeMapOffsetY, disableTallWallShadows } from './map-align.js';
 import { createCollisionWorld } from './collision-world.js';
+import { loadMapTextureSets, applyMapTextures } from './map-textures.js';
 import { initGameAdminPanel } from './game-admin.js';
 // Toutes les données de la map qui ne sont pas de la géométrie visuelle pure
 // (boîtes de collision, spawns d'équipe, lumières d'ambiance) — doit rester identique à
@@ -216,58 +217,69 @@ function enableGameIfReady() {
 // (voir l'import en haut du fichier).
 // ---------------------------------------------------------------------------
 
+// Textures de la carte (voir map-textures.js) : chargées en parallèle de map.glb.
+// Si elles échouent, la promesse donne null et la carte garde ses matériaux gris.
+const mapTexturesPromise = loadMapTextureSets(renderer);
+
 const mapLoader = new GLTFLoader();
 
 mapLoader.load(
   new URL('./assets/map.glb', document.baseURI).href,
   (gltf) => {
-    gltf.scene.traverse((child) => {
-      if (child.isMesh) {
-        child.castShadow = true;
-        child.receiveShadow = true;
-      }
-    });
+    mapTexturesPromise
+      .then((mapTextureSets) => {
+        gltf.scene.traverse((child) => {
+          if (child.isMesh) {
+            child.castShadow = true;
+            child.receiveShadow = true;
+          }
+        });
 
-    // Le GLB est déjà orienté correctement pour le jeu (Y-up).
-    // Ne pas le tourner : cela mettait la carte à la verticale.
-    // On conserve uniquement le décalage vertical nécessaire pour placer
-    // le sol à Y=0 et aligner la carte avec map-colliders.glb.
-    gltf.scene.rotation.set(0, 0, 0);
-    gltf.scene.scale.set(1, 1, 1);
-    // Alignement vertical mesuré plutôt qu'écrit en dur (voir map-align.js) : le
-    // sol visible doit être à Y = 0, comme celui des collisions.
-    gltf.scene.position.set(0, 0, 0);
-    gltf.scene.position.set(0, computeMapOffsetY(gltf.scene), 0);
-    scene.add(gltf.scene);
-    scene.remove(fallbackGround);
-    gltf.scene.updateMatrixWorld(true);
-    disableTallWallShadows(gltf.scene); // les murs d'enceinte de 100 m n'ombrent pas l'arène
-    ambiance.registerObject(scene); // (ombres en cascade : tous les matériaux doivent être préparés AVANT la compilation)
-    // Compile maintenant les shaders de tout ce qui est déjà dans la scène, en
-    // tâche de fond, plutôt qu'au premier affichage (sinon la 1re image de
-    // chaque nouveauté se fige le temps de la compilation).
-    if (renderer.compileAsync) renderer.compileAsync(scene, camera).catch(() => {});
-    else renderer.compile(scene, camera);
+        // Le GLB est déjà orienté correctement pour le jeu (Y-up).
+        // Ne pas le tourner : cela mettait la carte à la verticale.
+        // On conserve uniquement le décalage vertical nécessaire pour placer
+        // le sol à Y=0 et aligner la carte avec map-colliders.glb.
+        gltf.scene.rotation.set(0, 0, 0);
+        gltf.scene.scale.set(1, 1, 1);
+        // Alignement vertical mesuré plutôt qu'écrit en dur (voir map-align.js) : le
+        // sol visible doit être à Y = 0, comme celui des collisions.
+        gltf.scene.position.set(0, 0, 0);
+        gltf.scene.position.set(0, computeMapOffsetY(gltf.scene), 0);
+        scene.add(gltf.scene);
+        scene.remove(fallbackGround);
+        gltf.scene.updateMatrixWorld(true);
+        disableTallWallShadows(gltf.scene); // les murs d'enceinte de 100 m n'ombrent pas l'arène
+        applyMapTextures(gltf.scene, mapTextureSets, { ambiance }); // matériaux texturés (avant la compilation des shaders)
+        ambiance.registerObject(scene); // (ombres en cascade : tous les matériaux doivent être préparés AVANT la compilation)
+        // Compile maintenant les shaders de tout ce qui est déjà dans la scène, en
+        // tâche de fond, plutôt qu'au premier affichage (sinon la 1re image de
+        // chaque nouveauté se fige le temps de la compilation).
+        if (renderer.compileAsync) renderer.compileAsync(scene, camera).catch(() => {});
+        else renderer.compile(scene, camera);
 
-    const walkableMeshes = [];
-    gltf.scene.traverse((child) => {
-      if (child.isMesh && /floor|ramp/i.test(child.name)) {
-        walkableMeshes.push(child);
-      }
-    });
+        const walkableMeshes = [];
+        gltf.scene.traverse((child) => {
+          if (child.isMesh && /floor|ramp/i.test(child.name)) {
+            walkableMeshes.push(child);
+          }
+        });
 
-    groundObjects.length = 0;
-    groundObjects.push(...(walkableMeshes.length ? walkableMeshes : [gltf.scene]));
+        groundObjects.length = 0;
+        groundObjects.push(...(walkableMeshes.length ? walkableMeshes : [gltf.scene]));
 
-    (mapData.lights || []).forEach((l) => {
-      const light = new THREE.PointLight(l.color, l.intensity, l.distance, l.decay);
-      light.position.set(l.x, l.y, l.z);
-      scene.add(light);
-    });
+        (mapData.lights || []).forEach((l) => {
+          const light = new THREE.PointLight(l.color, l.intensity, l.distance, l.decay);
+          light.position.set(l.x, l.y, l.z);
+          scene.add(light);
+        });
 
-    mapLoaded = true;
-    console.info('[MAP-COLLIDERS] map.glb chargé correctement.');
-    enableGameIfReady();
+        mapLoaded = true;
+        console.info('[MAP-COLLIDERS] map.glb chargé correctement.');
+        enableGameIfReady();
+      })
+      .catch((error) => {
+        showMapError('Impossible de préparer map.glb (matériaux et textures).', error);
+      });
   },
   (progress) => {
     if (progress.total) {
