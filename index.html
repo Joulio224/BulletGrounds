@@ -719,7 +719,26 @@
       background: #ffd6a5;
       box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
     }
-    .character-face { font-size: calc(30px * var(--cs)); line-height: 1; }
+    .character-head { overflow: hidden; }
+    .character-hair {
+      position: absolute; left: -3%; right: -3%; top: -4%; height: 46%;
+      border-radius: 50% 50% 18% 18% / 90% 90% 20% 20%;
+    }
+    .character-hair[data-style="rase"] { height: 34%; }
+    .character-hair[data-style="long"] { height: 62%; border-radius: 50% 50% 8% 8% / 70% 70% 10% 10%; }
+    .character-hair[data-style="crete"] { left: 38%; right: 38%; top: -22%; height: 60%; border-radius: 40%; }
+    .character-hair[data-style="chauve"] { display: none; }
+    .character-hat { position: absolute; left: -5%; right: -5%; top: -8%; height: 44%; border-radius: 50% 50% 10% 10%; display: none; }
+    .character-hat[data-style="casquette"] { display: block; height: 40%; box-shadow: 0 calc(3px * var(--cs)) 0 -1px rgba(0, 0, 0, 0.35); }
+    .character-hat[data-style="bonnet"] { display: block; height: 50%; top: -14%; }
+    .character-hat[data-style="casque"] { display: block; height: 54%; top: -12%; box-shadow: inset 0 -4px 0 rgba(0, 0, 0, 0.3); }
+    .character-face {
+      position: absolute; left: 50%; top: 58%; width: 44%; height: 12%;
+      transform: translateX(-50%);
+      background:
+        radial-gradient(circle at 16% 50%, #2b1d14 0 38%, transparent 42%),
+        radial-gradient(circle at 84% 50%, #2b1d14 0 38%, transparent 42%);
+    }
     .character-body {
       position: relative;
       z-index: 1;
@@ -729,8 +748,12 @@
       border: 2px solid rgba(0, 0, 0, 0.3);
       border-radius: calc(28px * var(--cs));
       box-shadow: inset -6px -8px 12px rgba(0, 0, 0, 0.25), 0 4px 10px rgba(0, 0, 0, 0.35);
-      transition: background 0.15s ease;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
     }
+    .character-top { flex: 58 1 0; transition: background 0.15s ease; }
+    .character-bottom { flex: 42 1 0; transition: background 0.15s ease; }
     /* Mode Équipes : petit anneau coloré sur le perso de l'accueil */
     .character.team-red .character-body { box-shadow: 0 0 0 3px #e63946, inset -6px -8px 12px rgba(0, 0, 0, 0.25), 0 4px 10px rgba(0, 0, 0, 0.35); }
     .character.team-blue .character-body { box-shadow: 0 0 0 3px #3a86ff, inset -6px -8px 12px rgba(0, 0, 0, 0.25), 0 4px 10px rgba(0, 0, 0, 0.35); }
@@ -860,7 +883,31 @@
       background: rgba(255, 255, 255, 0.04);
       border: 1px solid rgba(255, 255, 255, 0.08);
     }
-    .appearance-controls { display: flex; flex-direction: column; gap: 10px; flex: 1; min-width: 200px; }
+    .appearance-preview { padding: 10px; line-height: 0; }
+    .appearance-canvas { display: block; width: 270px; height: 400px; max-width: 100%; border-radius: 10px; touch-action: none; user-select: none; }
+    .appearance-controls { display: flex; flex-direction: column; gap: 12px; flex: 1; min-width: 240px; }
+    .ap-tabs { display: flex; gap: 6px; }
+    .ap-tab {
+      flex: 1; padding: 9px 10px; border-radius: 8px; font-size: 0.9rem; font-weight: 600;
+      background: rgba(255, 255, 255, 0.07); border: 2px solid transparent; color: inherit; cursor: pointer;
+    }
+    .ap-tab.active { border-color: #e63946; background: rgba(230, 57, 70, 0.18); }
+    .ap-hint { font-size: 0.78rem; opacity: 0.65; line-height: 1.35; }
+    .ap-section { display: flex; flex-direction: column; gap: 7px; }
+    .ap-section-title { font-size: 0.82rem; opacity: 0.85; font-weight: 600; }
+    .swatch-grid { display: flex; flex-wrap: wrap; gap: 7px; }
+    .swatch {
+      width: 30px; height: 30px; padding: 0; border-radius: 50%; cursor: pointer;
+      border: 2px solid rgba(255, 255, 255, 0.25); box-shadow: inset 0 0 0 2px rgba(0, 0, 0, 0.25);
+    }
+    .swatch.selected { border-color: #fff; transform: scale(1.12); box-shadow: 0 0 0 2px #e63946, inset 0 0 0 2px rgba(0, 0, 0, 0.25); }
+    .ap-choice-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .ap-choice {
+      padding: 7px 12px; border-radius: 8px; font-size: 0.85rem; cursor: pointer; color: inherit;
+      background: rgba(255, 255, 255, 0.08); border: 2px solid transparent;
+    }
+    .ap-choice.selected { border-color: #e63946; background: rgba(230, 57, 70, 0.2); }
+    .appearance-color-input { width: 48px; height: 30px; padding: 2px; border-radius: 4px; border: 1px solid rgba(255, 255, 255, 0.2); background: transparent; cursor: pointer; }
     .appearance-color-label {
       display: flex;
       align-items: center;
@@ -974,7 +1021,19 @@
     .member-avatar.team-blue { border-color: #3a86ff; }
     .member-avatar.team-yellow { border-color: #ffd60a; }
     .member-avatar.team-green { border-color: #2dc653; }
-    .member-face { font-size: 22px; line-height: 1; }
+    .member-avatar { position: relative; overflow: hidden; }
+    .member-head {
+      position: absolute; left: 50%; top: 14%; width: 46%; height: 46%;
+      transform: translateX(-50%); border-radius: 50%; overflow: hidden;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+    }
+    .member-hair { position: absolute; left: -4%; right: -4%; top: -6%; height: 48%; border-radius: 50% 50% 20% 20%; }
+    .member-hair[data-style="rase"] { height: 34%; }
+    .member-hair[data-style="long"] { height: 70%; }
+    .member-hair[data-style="crete"] { left: 36%; right: 36%; top: -26%; height: 60%; }
+    .member-hair[data-style="chauve"] { display: none; }
+    .member-hat { position: absolute; left: -6%; right: -6%; top: -10%; height: 46%; border-radius: 50% 50% 10% 10%; display: none; }
+    .member-hat[data-style="casquette"], .member-hat[data-style="bonnet"], .member-hat[data-style="casque"] { display: block; }
     .member-name {
       font-size: 0.7rem;
       opacity: 0.85;
@@ -1543,13 +1602,7 @@
           <h2>Apparence</h2>
           <div class="appearance-row">
             <div id="appearance-preview" class="appearance-preview"></div>
-            <div class="appearance-controls">
-              <label class="appearance-color-label">
-                Couleur du corps
-                <input type="color" id="appearance-body-color" />
-              </label>
-              <div id="appearance-face-grid" class="face-grid"></div>
-            </div>
+            <div id="appearance-controls" class="appearance-controls"></div>
           </div>
         </div>
       </section>

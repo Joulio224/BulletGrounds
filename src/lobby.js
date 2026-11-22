@@ -36,6 +36,7 @@ import {
   initAppearancePicker,
   getAppearance,
   createCharacterElement,
+  fillMemberAvatar,
   DEFAULT_APPEARANCE,
 } from './appearance.js';
 import { saveMyAppearance, listenUserAppearance } from './profiles.js';
@@ -642,11 +643,7 @@ function buildMemberCard(uid, pseudo, group, isOwner) {
   avatarButton.title = canOpenMemberMenu ? `Options de ${pseudo || 'ce joueur'}` : (pseudo || 'Joueur');
   const avatar = document.createElement('div');
   avatar.className = 'member-avatar';
-  avatar.style.background = appearance.bodyColor;
-  const face = document.createElement('span');
-  face.className = 'member-face';
-  face.textContent = appearance.face;
-  avatar.appendChild(face);
+  fillMemberAvatar(avatar, appearance);
   if (group?.mode === 'team') {
     const currentTeam = group.memberTeams?.[uid] || null;
     ['red', 'blue', 'yellow', 'green'].forEach((team) => avatar.classList.toggle(`team-${team}`, currentTeam === team));

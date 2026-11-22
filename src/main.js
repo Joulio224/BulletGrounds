@@ -29,7 +29,8 @@ import {
   disconnectFromServer,
 } from './network.js';
 import { initShop, openShop, closeShop, isShopOpen, renderShop, rarityColor } from './shop.js';
-import { getAppearance, getEmojiTexture, sanitizeAppearance, DEFAULT_APPEARANCE } from './appearance.js';
+import { getAppearance, sanitizeAppearance, DEFAULT_APPEARANCE } from './appearance.js';
+import { createCharacterModel } from './character-model.js';
 import { getActiveGroupId, getActiveMode, getActiveTeam } from './game-session.js';
 import { getKeybinds, keyLabel, matchesAction } from './keybinds.js';
 import { getSettings } from './settings.js';
@@ -40,6 +41,9 @@ import {
   WEAPON_ORDER,
   GRENADE_DEFS,
   GRENADE_STEP,
+  GRENADE_THROW_SPEED,
+  GRENADE_THROW_LIFT,
+  GRENADE_RADIUS,
   stepGrenade,
   currentSpread,
   bulletOffsetY,
@@ -67,6 +71,7 @@ import { createHudFx } from './hudfx.js';
 import { computeMapOffsetY, disableTallWallShadows } from './map-align.js';
 import { createCollisionWorld } from './collision-world.js';
 import { loadMapTextureSets, applyMapTextures } from './map-textures.js';
+import { paintEggRequested, createPaintRoom } from './easter-egg-paint.js'; // easter egg « salle de peinture » (désactivé : voir PAINT_EGG.enabled)
 import { initGameAdminPanel } from './game-admin.js';
 // Toutes les données de la map qui ne sont pas de la géométrie visuelle pure
 // (boîtes de collision, spawns d'équipe, lumières d'ambiance) — doit rester identique à
@@ -228,6 +233,7 @@ mapLoader.load(
   (gltf) => {
     mapTexturesPromise
       .then((mapTextureSets) => {
+        mapScene = gltf.scene;
         gltf.scene.traverse((child) => {
           if (child.isMesh) {
             child.castShadow = true;
@@ -403,6 +409,10 @@ applySettings();
 });
 
 let networkStarted = false;
+// Easter egg « salle de peinture » : null tant qu'il n'est pas lancé (et il ne l'est jamais
+// tant que PAINT_EGG.enabled vaut false). `mapScene` = la vraie carte, qu'on masque pendant l'easter egg.
+let paintRoom = null;
+let mapScene = null;
 const menuEl = document.getElementById('menu');
 const quitButton = document.getElementById('quit-button');
 const resumeButton = document.getElementById('resume-button');
@@ -458,7 +468,9 @@ adminMenuButton?.addEventListener('click', () => {
 playButton.addEventListener('click', () => {
   audio.unlock();
   controls.lock();
-  startNetwork();
+  // Easter egg : la salle privée remplace la partie en ligne (jamais actif tant que PAINT_EGG.enabled = false).
+  if (paintEggRequested()) startPaintRoom();
+  else startNetwork();
 });
 // Quitter revient simplement au lobby via un rechargement de page : ça
 // coupe la connexion au serveur et repart sur un état propre, plutôt que de
@@ -1070,7 +1082,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 document.addEventListener('keydown', (e) => {
-  if (e.code !== keybinds.scoreboard || !networkStarted) return;
+  if (e.code !== keybinds.scoreboard || !networkStarted || paintRoom) return;
   e.preventDefault(); // sinon Tab déplace le focus du navigateur
   if (!e.repeat) scoreboard.show();
 });
@@ -1560,7 +1572,7 @@ document.addEventListener('keydown', (e) => {
 // le slot sélectionné si le stuff est plein, ou dans le slot vide sinon —
 // voir la logique côté serveur ('collect-weapon' dans server.js).
 document.addEventListener('keydown', (e) => {
-  if (e.code !== keybinds.pickupWeapon || isDead || isOverlayOpen() || !networkStarted) return;
+  if (e.code !== keybinds.pickupWeapon || isDead || isOverlayOpen() || !networkStarted || paintRoom) return;
   const closestId = findClosestGroundWeapon();
   if (closestId) sendCollectWeapon(closestId, currentSlot);
 });
@@ -1580,7 +1592,7 @@ initShop({
 });
 
 document.addEventListener('keydown', (e) => {
-  if (e.code !== keybinds.shop || isDead || !networkStarted || minimap.isOpen()) return;
+  if (e.code !== keybinds.shop || isDead || !networkStarted || minimap.isOpen() || paintRoom) return;
   if (isShopOpen()) {
     closeShop();
     controls.lock(); // touche B pressée = geste utilisateur direct, le verrouillage du pointeur est autorisé
@@ -1601,7 +1613,7 @@ const WORLD_UP = new THREE.Vector3(0, 1, 0);
 
 // Boutique OU carte ouverte : le joueur ne bouge, ne tire et ne change pas d'arme.
 function isOverlayOpen() {
-  return isShopOpen() || minimap.isOpen();
+  return isShopOpen() || minimap.isOpen() || (paintRoom?.isTerminalOpen() ?? false);
 }
 
 // --- Munitions & rechargement ------------------------------------------------
@@ -1863,6 +1875,7 @@ document.addEventListener('keydown', (e) => {
   lastThrowAt = now;
   const dir = new THREE.Vector3();
   camera.getWorldDirection(dir);
+  if (paintRoom) { throwPaintGrenade(kind, dir); return; } // Easter egg : lancer local, sans serveur
   sendThrowGrenade(kind, { x: dir.x, y: dir.y, z: dir.z });
 });
 
@@ -2162,7 +2175,7 @@ document.addEventListener('keydown', (e) => {
     menuEl.style.display = 'flex';
     return;
   }
-  if (!matchesAction(e, 'map', keybinds) || isDead || isShopOpen()) return;
+  if (!matchesAction(e, 'map', keybinds) || isDead || isShopOpen() || paintRoom) return;
   if (minimap.isOpen()) {
     minimap.close();
     controls.lock(); // touche pressée = geste utilisateur direct, le verrouillage est autorisé
@@ -2224,52 +2237,26 @@ function getTintedBodyColor(baseColor, steps) {
 }
 
 function createPlayerMesh(team, steps = 0, appearance = DEFAULT_APPEARANCE, mode = 'solo') {
-  const group = new THREE.Group();
-  const bodyColor = mode === 'team'
-    ? (TEAM_MARKER_COLORS[team] ?? TEAM_MARKER_COLORS.red)
-    : appearance.bodyColor;
-
-  const body = new THREE.Mesh(
-    new THREE.CapsuleGeometry(0.35, 1.1, 4, 8),
-    new THREE.MeshStandardMaterial({ color: getTintedBodyColor(bodyColor, steps) })
-  );
-  body.position.y = 0.9;
-  body.castShadow = true;
-  group.add(body);
-
-  const head = new THREE.Mesh(
-    new THREE.SphereGeometry(0.25, 12, 12),
-    new THREE.MeshStandardMaterial({ color: 0xffd6a5 })
-  );
-  head.position.y = 1.65;
-  head.castShadow = true;
-  group.add(head);
-
-  // Visage : un plan texturé avec l'emoji choisi (fond transparent), collé
-  // devant la tête. Pas de vraie bibliothèque de modèles 3D d'emojis pour
-  // Three.js (vérifié) — cette technique (canvas -> texture -> plan) est ce
-  // que font même les rares packages qui existent, voir appearance.js.
-  const face = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.32, 0.32),
-    new THREE.MeshBasicMaterial({ map: getEmojiTexture(appearance.face), transparent: true })
-  );
-  face.position.set(0, 1.66, -0.24);
-  face.rotation.y = Math.PI; // la face avant du plan (normale +Z) doit regarder vers -Z (l'avant du perso)
-  group.add(face);
+  const teamColor = TEAM_MARKER_COLORS[team] ?? TEAM_MARKER_COLORS.red;
+  // En mode Équipes, le HAUT prend la couleur de l'équipe (alliés/ennemis reconnaissables
+  // d'un coup d'œil) ; le reste (pantalon, tête…) reste personnel. En solo, tout est perso.
+  const topColor = mode === 'team' ? teamColor : appearance.topColor;
+  const model = createCharacterModel(appearance, { topColor: getTintedBodyColor(topColor, steps) });
+  const group = model.group;
 
   // Pastille d'équipe — repère fixe, indépendant du skin choisi.
   const marker = new THREE.Mesh(
     new THREE.SphereGeometry(0.07, 8, 6),
     new THREE.MeshStandardMaterial({
-      color: TEAM_MARKER_COLORS[team] ?? TEAM_MARKER_COLORS.red,
-      emissive: TEAM_MARKER_COLORS[team] ?? TEAM_MARKER_COLORS.red,
+      color: teamColor,
+      emissive: teamColor,
       emissiveIntensity: 0.6,
     })
   );
   marker.position.y = 2.02;
   group.add(marker);
 
-  return { group, bodyMaterial: body.material };
+  return { group, model };
 }
 
 function addOtherPlayer({ id, position, rotationY, team, mode = 'solo', shieldSteps, appearance, pseudo, groupId }) {
@@ -2278,7 +2265,7 @@ function addOtherPlayer({ id, position, rotationY, team, mode = 'solo', shieldSt
   const bodyColor = mode === 'team'
     ? (TEAM_MARKER_COLORS[team] ?? TEAM_MARKER_COLORS.red)
     : safeAppearance.bodyColor;
-  const { group: mesh, bodyMaterial } = createPlayerMesh(team, shieldSteps || 0, safeAppearance, mode);
+  const { group: mesh, model } = createPlayerMesh(team, shieldSteps || 0, safeAppearance, mode);
   if (position) {
     mesh.position.set(position.x, position.y - EYE_HEIGHT, position.z);
   }
@@ -2286,7 +2273,8 @@ function addOtherPlayer({ id, position, rotationY, team, mode = 'solo', shieldSt
   scene.add(mesh);
   otherPlayers.set(id, {
     mesh,
-    bodyMaterial,
+    model,
+    smoothSpeed: 0,
     pseudo: pseudo || '',
     groupId: groupId || null,
     appearance: safeAppearance,
@@ -2301,7 +2289,7 @@ function addOtherPlayer({ id, position, rotationY, team, mode = 'solo', shieldSt
 function updatePlayerShieldSteps({ id, steps }) {
   const entry = otherPlayers.get(id);
   if (!entry) return;
-  entry.bodyMaterial.color.copy(getTintedBodyColor(entry.bodyColor, steps));
+  entry.model.setTopColor(getTintedBodyColor(entry.bodyColor, steps));
 }
 
 function updateOtherPlayer({ id, position, rotationY }) {
@@ -2555,7 +2543,12 @@ function tryShoot(now) {
     const hit = traceShot(origin, dir, def.range ?? DEFAULT_RANGE, null, def.ballistics);
     _shotEnd.copy(origin).addScaledVector(dir, hit.distance);
     drawTracer(_muzzleLocal, hit, _shotEnd); // traceur fin, depuis la bouche du canon
-    if (hit.kind) fx.impact({ point: hit.point, normal: hit.normal, kind: hit.kind === 'body' ? 'body' : 'surface', light: def.pellets > 1 });
+    if (paintRoom) {
+      // Easter egg : un impact sur un mur ou le sol laisse un rond de peinture, plus gros si l'arme tire lentement.
+      if (hit.kind && hit.kind !== 'body') paintRoom.onShot({ point: hit.point, normal: hit.normal, def });
+    } else if (hit.kind) {
+      fx.impact({ point: hit.point, normal: hit.normal, kind: hit.kind === 'body' ? 'body' : 'surface', light: def.pellets > 1 });
+    }
   }
   showMuzzleFlash(equipped.id);
   ejectShellFor(equipped.id);
@@ -2591,6 +2584,91 @@ function handleTeamAssigned({ team, spawn }) {
     teamLabelEl.classList.remove('team-red', 'team-blue', 'team-yellow', 'team-green');
     teamLabelEl.classList.add(`team-${teamNames[team] ? team : 'red'}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Easter egg « salle de peinture » (voir easter-egg-paint.js)
+// Rien de tout ça ne tourne tant que PAINT_EGG.enabled vaut false.
+// On y est SEUL : aucune connexion au serveur, donc personne d'autre, aucun risque
+// d'être touché, et aucun message envoyé (sendMove/sendShoot sont sans effet hors connexion).
+// ---------------------------------------------------------------------------
+function paintSetWeapon(id) {
+  const def = WEAPON_DEFS[id];
+  if (!def) return;
+  const next = [{ id: 'pistol', rarity: 'gray', ammo: WEAPON_DEFS.pistol.magSize }, null];
+  if (id !== 'pistol') next[def.slot] = { id, rarity: 'gray', ammo: def.magSize };
+  handleWeaponsUpdate(next);
+  selectSlot(id === 'pistol' ? 0 : def.slot);
+}
+
+// Lancer de grenade local : même départ et même vitesse que sur le serveur, même
+// physique côté client (stepGrenade), puis explosion après la durée de la mèche.
+function throwPaintGrenade(kind, dir) {
+  const def = GRENADE_DEFS[kind];
+  if (!def) return;
+  let position = {
+    x: camera.position.x + dir.x * 0.6,
+    y: camera.position.y - 0.1 + dir.y * 0.6,
+    z: camera.position.z + dir.z * 0.6,
+  };
+  if (collisionWorld?.collidesSphere?.(position.x, position.y, position.z, GRENADE_RADIUS)) {
+    position = { x: camera.position.x, y: camera.position.y - 0.1, z: camera.position.z };
+  }
+  const velocity = {
+    x: dir.x * GRENADE_THROW_SPEED,
+    y: dir.y * GRENADE_THROW_SPEED + GRENADE_THROW_LIFT,
+    z: dir.z * GRENADE_THROW_SPEED,
+  };
+  const id = `paint-${Math.random().toString(36).slice(2)}`;
+  handleGrenadeSpawned({ id, kind, owner: 'paint-room', position, velocity });
+  throwKick = 1;
+  audio.playGrenadeThrow();
+  setTimeout(() => {
+    const flying = activeGrenades.get(id);
+    const where = flying ? { x: flying.pos.x, y: flying.pos.y, z: flying.pos.z } : position;
+    handleGrenadeExploded({ id, kind, position: where });
+    paintRoom?.onGrenadeExploded(where, kind);
+  }, def.fuse * 1000);
+}
+
+function startPaintRoom() {
+  if (networkStarted || paintRoom) return;
+  networkStarted = true; // active les touches du jeu ; rien n'est envoyé (pas de connexion)
+  setSpectatorVision(false);
+  keybinds = getKeybinds();
+  applySettings();
+  adminState.infiniteAmmo = true; // munitions illimitées
+  myGrenades = { frag: 99, smoke: 99 };
+  updateGrenadeUI();
+  paintRoom = createPaintRoom({
+    scene,
+    camera,
+    renderer,
+    ambiance,
+    audio,
+    hudFx,
+    getKeybinds: () => keybinds,
+    keyLabel,
+    hooks: {
+      hideWorld: () => {
+        if (mapScene) mapScene.visible = false;
+        zoneMesh.visible = false;
+      },
+      setCollision: (world) => { collisionWorld = world; },
+      setGround: (objects) => {
+        groundObjects.length = 0;
+        groundObjects.push(...objects);
+        lastGroundY = 0;
+      },
+      placePlayer: (position) => {
+        camera.position.copy(position);
+        camera.rotation.set(0, 0, 0);
+      },
+      setWeapon: paintSetWeapon,
+      giveGrenades: () => {},
+    },
+  });
+  paintRoom.enter();
 }
 
 async function startNetwork() {
@@ -2943,16 +3021,28 @@ function animate() {
   // framerate. Le serveur compense malgré tout le retard réseau restant côté
   // tir (voir HIT_REWIND_MS dans server.js) — ce réglage-ci ne joue que sur
   // le confort visuel, pas sur l'équité des tirs.
-  otherPlayers.forEach(({ mesh, targetPosition, targetRotationY }) => {
+  otherPlayers.forEach((entry) => {
+    const { mesh, targetPosition, targetRotationY } = entry;
     const followFactor = Math.min(1, 25 * delta);
+    const previousX = mesh.position.x;
+    const previousZ = mesh.position.z;
     mesh.position.lerp(targetPosition, followFactor);
     mesh.rotation.y += (targetRotationY - mesh.rotation.y) * followFactor;
+
+    // Animation de marche : vitesse au sol constatée (lissée), uniquement si le joueur est visible.
+    if (entry.model && mesh.visible && delta > 0) {
+      const speed = Math.hypot(mesh.position.x - previousX, mesh.position.z - previousZ) / delta;
+      entry.smoothSpeed += (Math.min(speed, 14) - entry.smoothSpeed) * Math.min(1, delta * 8);
+      entry.model.update(delta, entry.smoothSpeed);
+    }
   });
 
   // Position locale envoyée au serveur, mais pas à chaque frame (inutile et
   // ça surchargerait le réseau pour rien). On arrête d'en envoyer pendant
   // qu'on est mort (le serveur ignore de toute façon les 'move' des morts).
-  if (networkStarted && !isDead) {
+  if (paintRoom) paintRoom.update(delta); // Easter egg : peinture, terminal, interface
+
+  if (networkStarted && !isDead && !paintRoom) {
     timeSinceLastMoveSent += delta;
     if (timeSinceLastMoveSent >= MOVE_SEND_INTERVAL) {
       timeSinceLastMoveSent = 0;
