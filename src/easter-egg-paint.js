@@ -8,8 +8,8 @@
 // là où il est peint, la peinture s'éclaircit pour former des chiffres (voir
 // PAINT_EGG.code et PAINT_EGG.reveal). Ce code s'entre sur le terminal de la salle.
 //
-// ACCÈS : désactivé pour l'instant (PAINT_EGG.enabled = false). Rien ne mène à
-// cette salle tant que ce n'est pas branché. Pour la tester, voir LISEZMOI.
+// ACCÈS : deux portes (PAINT_EGG.doors) — un bouton réservé aux admins dans le menu
+// pause, et une éclaboussure sur un mur de la vraie carte (paint-secret-spot.js).
 //
 // Fichiers : paint-room-map.js (la salle), paint-atlas.js (la peinture),
 // ce fichier (règles du jeu, terminal, interface). main.js ne fait que prêter
@@ -22,9 +22,25 @@ import { createCollisionWorld } from './collision-world.js';
 
 // ------------------------------------------------------------------ réglages
 export const PAINT_EGG = {
-  // ⛔ Interrupteur général. Tant que c'est false, startPaintRoom() ne fait rien
-  // et aucune porte d'entrée n'existe.
-  enabled: false,
+  // Interrupteur général. Sur false, l'easter egg n'existe plus : aucune porte, aucun bouton.
+  enabled: true,
+
+  // Les portes d'entrée (chacune peut être coupée séparément) :
+  doors: {
+    admin: true, // bouton « Salle de peinture (test) » dans le menu pause, réservé aux admins
+    map: true, // l'éclaboussure sur un mur de la vraie carte : tirer dessus téléporte dans la salle
+  },
+
+  // L'éclaboussure secrète (voir paint-secret-spot.js). Le mur sud de la carte est à z = 75 ;
+  // ce coin se trouve derrière le gros bloc du couloir sud, à l'abri des regards.
+  secretSpot: {
+    position: [18, 1.6, 74.96], // centre de la tache (x, y, z)
+    normal: [0, 0, -1], // le mur regarde vers -Z
+    size: 3.0, // taille de la tache (m)
+    radius: 1.0, // un tir doit tomber à moins de 1 m du centre
+    hitsNeeded: 3, // nombre de tirs...
+    windowSeconds: 4, // ...dans cet intervalle de temps
+  },
   // Clé de session qui demande la salle au prochain « Cliquer pour jouer ».
   sessionKey: 'mw_paint_room',
   solvedKey: 'mw_paint_egg_solved',
@@ -69,6 +85,9 @@ export function paintEggRequested() {
   } catch {
     return false;
   }
+}
+export function paintEggDoorOpen(door) {
+  return Boolean(PAINT_EGG.enabled && PAINT_EGG.doors?.[door]);
 }
 // À brancher plus tard sur la vraie porte d'entrée (clic secret, code, évènement…).
 export function requestPaintRoom() {
@@ -191,8 +210,10 @@ const STYLE = `
 #paint-banner { position: fixed; left: 50%; top: 14%; transform: translateX(-50%); z-index: 40; padding: 12px 22px; border-radius: 10px;
   background: rgba(14,16,20,0.8); color: #fff; font: 600 15px system-ui, sans-serif; text-align: center; max-width: 80vw; opacity: 0;
   transition: opacity 0.5s ease; pointer-events: none; }
+/* en salle de peinture : on masque ce qui ne concerne que la partie en ligne */
 body.paint-room #kill-feed, body.paint-room #team-label, body.paint-room #money-hud, body.paint-room #zone-warning,
-body.paint-room #scoreboard, body.paint-room #hud > *:not(#crosshair) { display: none !important; }
+body.paint-room #scoreboard, body.paint-room #ping-layer, body.paint-room #health-bar, body.paint-room #shield-bar,
+body.paint-room #vest-stock, body.paint-room #low-hp-vignette, body.paint-room #pickup-prompt { display: none !important; }
 `;
 
 function el(tag, attrs = {}, text) {

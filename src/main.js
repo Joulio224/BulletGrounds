@@ -71,7 +71,8 @@ import { createHudFx } from './hudfx.js';
 import { computeMapOffsetY, disableTallWallShadows } from './map-align.js';
 import { createCollisionWorld } from './collision-world.js';
 import { loadMapTextureSets, applyMapTextures } from './map-textures.js';
-import { paintEggRequested, createPaintRoom } from './easter-egg-paint.js'; // easter egg « salle de peinture » (désactivé : voir PAINT_EGG.enabled)
+import { PAINT_EGG, paintEggRequested, paintEggDoorOpen, createPaintRoom } from './easter-egg-paint.js'; // easter egg « salle de peinture »
+import { createPaintSecretSpot } from './paint-secret-spot.js';
 import { initGameAdminPanel } from './game-admin.js';
 // Toutes les données de la map qui ne sont pas de la géométrie visuelle pure
 // (boîtes de collision, spawns d'équipe, lumières d'ambiance) — doit rester identique à
@@ -234,6 +235,9 @@ mapLoader.load(
     mapTexturesPromise
       .then((mapTextureSets) => {
         mapScene = gltf.scene;
+        if (paintEggDoorOpen('map') && !paintSecretSpot) {
+          paintSecretSpot = createPaintSecretSpot({ scene, config: PAINT_EGG.secretSpot, onTriggered: enterPaintRoomFromMatch });
+        }
         gltf.scene.traverse((child) => {
           if (child.isMesh) {
             child.castShadow = true;
@@ -412,11 +416,18 @@ let networkStarted = false;
 // Easter egg « salle de peinture » : null tant qu'il n'est pas lancé (et il ne l'est jamais
 // tant que PAINT_EGG.enabled vaut false). `mapScene` = la vraie carte, qu'on masque pendant l'easter egg.
 let paintRoom = null;
+let paintSecretSpot = null; // l'éclaboussure secrète sur un mur de la vraie carte
 let mapScene = null;
 const menuEl = document.getElementById('menu');
 const quitButton = document.getElementById('quit-button');
 const resumeButton = document.getElementById('resume-button');
 const adminMenuButton = document.getElementById('admin-menu-button');
+const paintRoomButton = document.getElementById('paint-room-button');
+// Bouton « Salle de peinture (test) » : admins seulement, en partie, et seulement si cette porte est ouverte.
+function refreshPaintRoomButton() {
+  if (!paintRoomButton) return;
+  paintRoomButton.hidden = !(paintEggDoorOpen('admin') && isAdminUser && networkStarted && !paintRoom);
+}
 const gameAdminPanel = initGameAdminPanel({
   sendAction: sendAdminAction,
   refreshPlayers: requestAdminPlayers,
@@ -445,12 +456,14 @@ onAuthStateChanged(auth, (user) => {
   isAdminUser = false;
   gameAdminPanel.setAdmin(false);
   if (adminMenuButton) adminMenuButton.hidden = true;
+  refreshPaintRoomButton();
   sanctionScreen.set(null);
   if (!user) return;
   ownSanctionUnsub = listenOwnSanction(user.uid, (sanction) => sanctionScreen.set(sanction));
   adminProfileUnsub = onSnapshot(doc(db, 'users', user.uid), (snap) => {
     isAdminUser = String(snap.data()?.admin).toLowerCase() === 'true';
-    if (adminMenuButton) adminMenuButton.hidden = !isAdminUser || !networkStarted;
+    if (adminMenuButton) adminMenuButton.hidden = !isAdminUser || !networkStarted || Boolean(paintRoom);
+    refreshPaintRoomButton();
     gameAdminPanel.setAdmin(isAdminUser, window.__miniWarzoneAdminUser);
   }, () => { isAdminUser = false; if (adminMenuButton) adminMenuButton.hidden = true; gameAdminPanel.setAdmin(false); });
 });
@@ -463,6 +476,10 @@ resumeButton?.addEventListener('click', () => {
 adminMenuButton?.addEventListener('click', () => {
   if (!isAdminUser) return;
   gameAdminPanel.open();
+});
+paintRoomButton?.addEventListener('click', () => {
+  if (!isAdminUser || !paintEggDoorOpen('admin')) return; // (confort : la salle est hors ligne et sans danger)
+  enterPaintRoomFromMatch();
 });
 
 playButton.addEventListener('click', () => {
@@ -489,7 +506,8 @@ controls.addEventListener('unlock', () => {
   // la section "Boutique" plus bas.
   if (isShopOpen() || minimap.isOpen()) return;
   if (resumeButton) resumeButton.hidden = !networkStarted;
-  if (adminMenuButton) adminMenuButton.hidden = !isAdminUser || !networkStarted;
+  if (adminMenuButton) adminMenuButton.hidden = !isAdminUser || !networkStarted || Boolean(paintRoom);
+  refreshPaintRoomButton();
   menuEl.style.display = 'flex';
 });
 
@@ -2548,6 +2566,8 @@ function tryShoot(now) {
       if (hit.kind && hit.kind !== 'body') paintRoom.onShot({ point: hit.point, normal: hit.normal, def });
     } else if (hit.kind) {
       fx.impact({ point: hit.point, normal: hit.normal, kind: hit.kind === 'body' ? 'body' : 'surface', light: def.pellets > 1 });
+      // Easter egg : tirer plusieurs fois sur l'éclaboussure secrète téléporte dans la salle de peinture.
+      if (hit.kind === 'surface') paintSecretSpot?.onShot(hit.point);
     }
   }
   showMuzzleFlash(equipped.id);
@@ -2631,6 +2651,28 @@ function throwPaintGrenade(kind, dir) {
   }, def.fuse * 1000);
 }
 
+// Entrée dans la salle DEPUIS une partie en ligne (bouton admin, éclaboussure secrète) :
+// on quitte la partie (les autres te voient partir), on ramasse tout ce qui en dépend,
+// puis on lance la salle — hors ligne, sans personne d'autre.
+function enterPaintRoomFromMatch() {
+  if (paintRoom) return;
+  if (networkStarted) {
+    disconnectFromServer();
+    [...otherPlayers.keys()].forEach(removeOtherPlayer);
+    [...groundVestMeshes.keys()].forEach(removeGroundVest);
+    [...groundWeaponPickups.keys()].forEach(removeGroundWeaponPickup);
+    activeGrenades.forEach((grenade) => scene.remove(grenade.mesh));
+    activeGrenades.clear();
+    if (isShopOpen()) closeShop();
+    if (minimap.isOpen()) minimap.close();
+    isDead = false;
+    networkStarted = false;
+  }
+  audio.unlock();
+  controls.lock();
+  startPaintRoom();
+}
+
 function startPaintRoom() {
   if (networkStarted || paintRoom) return;
   networkStarted = true; // active les touches du jeu ; rien n'est envoyé (pas de connexion)
@@ -2652,6 +2694,8 @@ function startPaintRoom() {
     hooks: {
       hideWorld: () => {
         if (mapScene) mapScene.visible = false;
+        paintSecretSpot?.setVisible(false);
+        fallbackGround.visible = false;
         zoneMesh.visible = false;
       },
       setCollision: (world) => { collisionWorld = world; },
@@ -2669,6 +2713,7 @@ function startPaintRoom() {
     },
   });
   paintRoom.enter();
+  refreshPaintRoomButton();
 }
 
 async function startNetwork() {
