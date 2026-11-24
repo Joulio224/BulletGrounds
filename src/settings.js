@@ -73,6 +73,18 @@ export const SETTING_DEFS = [
     type: 'toggle',
     default: true,
   },
+  {
+    id: 'desktopNotifications',
+    label: 'Notifications sur l\'ordinateur (messages, invitations, demandes d\'ami) quand le jeu est en arrière-plan',
+    type: 'toggle',
+    default: true,
+  },
+  {
+    id: 'ingameAlerts',
+    label: 'Alertes à l\'écran pendant la partie (nouveaux messages)',
+    type: 'toggle',
+    default: true,
+  },
 ];
 
 export const DEFAULT_SETTINGS = Object.fromEntries(SETTING_DEFS.map((d) => [d.id, d.default]));

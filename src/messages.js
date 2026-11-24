@@ -45,6 +45,8 @@ let threadUnsub = null;
 let tabVisible = false;
 let readState = {}; // id -> ms du dernier message affiché
 let onUnreadChange = () => {};
+let onIncomingMessage = () => {}; // ({ convId, kind, title, from, text }) : nouveau message d'un autre
+const baselineDone = new Set(); // conversations dont le 1er instantané (historique) est passé : pas de notif pour lui
 
 let listEl = null;
 let headerEl = null;
@@ -117,6 +119,7 @@ function rebuildConversations() {
     unsub();
     latestUnsubs.delete(id);
     latestByConv.delete(id);
+    baselineDone.delete(id);
   });
   if (activeId && !wanted.has(activeId)) closeThread();
 
@@ -130,7 +133,23 @@ function rebuildConversations() {
         q,
         (snap) => {
           const data = snap.docs[0]?.data({ serverTimestamps: 'estimate' });
+          const previous = latestByConv.get(conv.id);
           if (data) {
+            // Nouveau message d'un autre, arrivé APRÈS le chargement initial : on prévient, sauf
+            // si on est justement en train de lire cette conversation avec la fenêtre au premier plan.
+            const ms = data.createdAt?.toMillis?.() ?? Date.now();
+            const isNew =
+              baselineDone.has(conv.id) && data.fromUid !== me?.uid && (!previous || ms > previous.ms);
+            const beingRead = tabVisible && activeId === conv.id && document.hasFocus();
+            if (isNew && !beingRead) {
+              onIncomingMessage({
+                convId: conv.id,
+                kind: conv.kind,
+                title: conv.title,
+                from: data.fromPseudo || conv.title,
+                text: String(data.text ?? ''),
+              });
+            }
             latestByConv.set(conv.id, {
               ms: data.createdAt?.toMillis?.() ?? Date.now(),
               fromUid: data.fromUid,
@@ -139,6 +158,7 @@ function rebuildConversations() {
           } else {
             latestByConv.delete(conv.id);
           }
+          baselineDone.add(conv.id);
           if (tabVisible && activeId === conv.id) {
             markRead(conv.id, latestByConv.get(conv.id)?.ms);
           }
@@ -342,8 +362,9 @@ async function sendMessage(text) {
 // --- API pour lobby.js ---------------------------------------------------------------
 // À appeler une fois au démarrage. onUnreadChange(n) reçoit le nombre de
 // conversations avec au moins un message non lu (pour la pastille du menu).
-export function initMessaging({ onUnreadChange: onChange } = {}) {
+export function initMessaging({ onUnreadChange: onChange, onIncomingMessage: onIncoming } = {}) {
   if (onChange) onUnreadChange = onChange;
+  if (onIncoming) onIncomingMessage = onIncoming;
   listEl = document.getElementById('conversation-list');
   headerEl = document.getElementById('thread-header');
   messagesEl = document.getElementById('thread-messages');
@@ -366,6 +387,7 @@ export function setMessagingUser(user) {
   latestUnsubs.forEach((unsub) => unsub());
   latestUnsubs.clear();
   latestByConv.clear();
+  baselineDone.clear();
   closeThread();
   friendsSource = [];
   groupsSource = [];

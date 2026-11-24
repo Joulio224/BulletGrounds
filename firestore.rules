@@ -141,7 +141,7 @@ service cloud.firestore {
           !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId', 'name', 'createdAt']) &&
           (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['adminId']) ||
             request.auth.uid == resource.data.ownerId) &&
-          (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['settings', 'match']) ||
+          (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['settings', 'match', 'bots']) ||
             request.auth.uid == resource.data.ownerId ||
             request.auth.uid == resource.data.get('adminId', null)))
         ||
@@ -159,8 +159,16 @@ service cloud.firestore {
     // l'émetteur et le destinataire peuvent la lire, et seul l'émetteur (déjà
     // membre du groupe visé) peut en créer une.
     match /groupInvites/{inviteId} {
+      // Le créateur et l'admin du groupe voient et annulent aussi les invitations en attente
+      // (paramètres du groupe), même celles envoyées par quelqu'un d'autre.
+      function isInviteGroupManager() {
+        let g = get(/databases/$(database)/documents/groups/$(resource.data.groupId)).data;
+        return request.auth.uid == g.ownerId || request.auth.uid == g.get('adminId', null);
+      }
+
       allow read: if request.auth != null &&
-        (request.auth.uid == resource.data.fromUid || request.auth.uid == resource.data.toUid);
+        (request.auth.uid == resource.data.fromUid || request.auth.uid == resource.data.toUid ||
+          (exists(/databases/$(database)/documents/groups/$(resource.data.groupId)) && isInviteGroupManager()));
 
       allow create: if request.auth != null &&
         request.auth.uid == request.resource.data.fromUid &&
@@ -168,7 +176,8 @@ service cloud.firestore {
         request.resource.data.status == 'pending';
 
       allow delete: if request.auth != null &&
-        (request.auth.uid == resource.data.fromUid || request.auth.uid == resource.data.toUid);
+        (request.auth.uid == resource.data.fromUid || request.auth.uid == resource.data.toUid ||
+          (exists(/databases/$(database)/documents/groups/$(resource.data.groupId)) && isInviteGroupManager()));
     }
 
     // Messagerie — messages privés entre amis. {dmId} est l'id du doc

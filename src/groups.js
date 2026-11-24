@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 // groups/{groupId} { name, ownerId, members: [uid...], memberPseudos: {uid: pseudo},
 //                     mode: 'solo'|'team', memberTeams: {uid: 'red'|'blue'|'yellow'|'green'}, createdAt }
+//                     bots: { [botId]: { name, level: 'easy'|'normal'|'strong'|'insane' } }  (voir plus bas)
 // groupInvites/{inviteId} { groupId, groupName, fromUid, fromPseudo, toUid, toPseudo, status, createdAt }
 import {
   collection,
@@ -148,4 +149,117 @@ export async function acceptGroupInvite(invite) {
 
 export async function declineGroupInvite(inviteId) {
   await deleteDoc(doc(db, 'groupInvites', inviteId));
+}
+
+// --- Invitations envoyées -----------------------------------------------------
+// Annuler une invitation = supprimer son document (le destinataire ne la voit plus).
+// Les règles autorisent l'émetteur, le destinataire et le créateur / l'admin du groupe.
+export async function cancelGroupInvite(inviteId) {
+  await deleteDoc(doc(db, 'groupInvites', inviteId));
+}
+
+// Invitations que TOI tu as envoyées (tous groupes) : sert à ne pas réinviter quelqu'un
+// déjà invité, dans la fenêtre « Ajouter ».
+export function listenMySentGroupInvites(myUid, callback) {
+  const q = query(collection(db, 'groupInvites'), where('fromUid', '==', myUid));
+  return onSnapshot(
+    q,
+    (snap) => callback(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+    () => callback([])
+  );
+}
+
+// Toutes les invitations en attente d'UN groupe (celles du créateur ET des admins), pour les
+// paramètres du groupe. Si les règles Firestore pas encore mises à jour refusent cette requête,
+// on retombe sur les seules invitations envoyées par toi.
+export function listenGroupInvites(groupId, myUid, callback) {
+  let fallbackUnsub = null;
+  const unsub = onSnapshot(
+    query(collection(db, 'groupInvites'), where('groupId', '==', groupId)),
+    (snap) => callback(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+    () => {
+      fallbackUnsub = onSnapshot(
+        query(collection(db, 'groupInvites'), where('fromUid', '==', myUid)),
+        (snap) =>
+          callback(snap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((i) => i.groupId === groupId)),
+        () => callback([])
+      );
+    }
+  );
+  return () => {
+    unsub();
+    fallbackUnsub?.();
+  };
+}
+
+// --- Bots ---------------------------------------------------------------------
+// Un bot est stocké dans groups/{id}.bots.{botId} = { name, level }. Il n'est PAS dans `members`
+// (ce sont des comptes) mais, en mode Équipes, il a une équipe comme les autres :
+// memberTeams.{botId}. C'est le serveur de jeu (bots.js) qui le fait jouer.
+// Seuls le créateur et l'admin du groupe peuvent les gérer (règles Firestore).
+export const BOT_LEVELS = [
+  { id: 'easy', label: 'Facile', hint: 'Lent, vise mal, réagit tard' },
+  { id: 'normal', label: 'Normal', hint: 'Un adversaire correct' },
+  { id: 'strong', label: 'Fort', hint: 'Rapide, précis, bouclier' },
+  { id: 'insane', label: 'Très fort', hint: 'Redoutable : réflexes, précision, gros stuff' },
+];
+export const MAX_BOTS_PER_GROUP = 8;
+const BOT_NAMES = ['Rex', 'Nova', 'Zed', 'Blitz', 'Echo', 'Viper', 'Onyx', 'Titan', 'Ghost', 'Raven', 'Pixel', 'Storm', 'Jinx', 'Cobra', 'Bolt', 'Lynx'];
+const TEAM_IDS = ['red', 'blue', 'yellow', 'green'];
+const BOT_COLORS = { easy: '#5f8a4a', normal: '#4f86c6', strong: '#c8641e', insane: '#8a2f2f' };
+
+export function botLevelLabel(level) {
+  return BOT_LEVELS.find((l) => l.id === level)?.label || 'Normal';
+}
+
+// Skin affiché dans le lobby (même couleur que celui que le serveur donne au bot en jeu).
+export function botAppearance(level) {
+  const color = BOT_COLORS[level] || BOT_COLORS.normal;
+  return {
+    topColor: color, bodyColor: color, bottomColor: '#1c1d20', skin: '#b8bcc2',
+    hair: 'rase', hairColor: '#1d1f22', headgear: 'casque', headgearColor: '#3b3f46',
+  };
+}
+
+export function listGroupBots(group) {
+  return Object.entries(group?.bots || {})
+    .map(([key, cfg]) => ({ key, name: cfg?.name || 'Bot', level: cfg?.level || 'normal' }))
+    .sort((a, b) => a.key.localeCompare(b.key));
+}
+
+export async function addBotToGroup(group, level) {
+  if (!BOT_LEVELS.some((l) => l.id === level)) throw new Error('Niveau de bot invalide.');
+  const bots = listGroupBots(group);
+  if (bots.length >= MAX_BOTS_PER_GROUP) {
+    throw new Error(`Maximum ${MAX_BOTS_PER_GROUP} bots par groupe.`);
+  }
+  const key = `bot_${Math.random().toString(36).slice(2, 8)}`;
+  const used = new Set(bots.map((b) => b.name));
+  const free = BOT_NAMES.filter((n) => !used.has(n));
+  const pool = free.length ? free : BOT_NAMES;
+  const name = pool[Math.floor(Math.random() * pool.length)];
+
+  const update = { [`bots.${key}`]: { name, level } };
+  if (group.mode === 'team') {
+    // Mode Équipes : le bot rejoint l'équipe la moins remplie (modifiable ensuite via son rond)
+    const counts = Object.fromEntries(TEAM_IDS.map((t) => [t, 0]));
+    Object.values(group.memberTeams || {}).forEach((t) => {
+      if (t in counts) counts[t] += 1;
+    });
+    update[`memberTeams.${key}`] = TEAM_IDS.reduce((least, t) => (counts[t] < counts[least] ? t : least), TEAM_IDS[0]);
+  }
+  await updateDoc(doc(db, 'groups', group.id), update);
+  return key;
+}
+
+export async function setBotLevel(groupId, botKey, level) {
+  if (!BOT_LEVELS.some((l) => l.id === level)) return;
+  await updateDoc(doc(db, 'groups', groupId), { [`bots.${botKey}.level`]: level });
+}
+
+export async function removeBotFromGroup(groupId, botKey) {
+  await updateDoc(doc(db, 'groups', groupId), {
+    [`bots.${botKey}`]: deleteField(),
+    [`memberTeams.${botKey}`]: deleteField(),
+  });
 }

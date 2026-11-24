@@ -11,6 +11,7 @@
 // les réglages à tous les joueurs du groupe.
 import { doc, updateDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from './firebase.js';
+import { listenGroupInvites, cancelGroupInvite } from './groups.js';
 
 export const DEFAULT_GROUP_SETTINGS = {
   elimination: false,
@@ -142,6 +143,11 @@ function injectStyle() {
     #gs-modal .gs-row span { color: #aaa; font-size: 0.82rem; }
     #gs-modal .gs-match { border-top: 1px solid #2c2c36; padding-top: 12px; margin-top: 4px; }
     #gs-modal .gs-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+    #gs-modal .gs-invites { border-top: 1px solid #2c2c36; padding-top: 12px; margin-top: 4px; }
+    #gs-modal .gs-invite-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
+    #gs-modal .gs-invite-row .gs-invite-name { flex: 1; min-width: 0; }
+    #gs-modal .gs-invite-row .gs-invite-name span { display: block; color: #aaa; font-size: 0.78rem; }
+    #gs-modal .gs-invite-row button { padding: 4px 10px; font-size: 0.8rem; }
     #gs-modal .gs-error { color: #ff8f8f; font-size: 0.85rem; min-height: 1em; margin: 8px 0 0; }
   `;
   document.head.appendChild(style);
@@ -159,9 +165,10 @@ export function createGearButton(onClick) {
   return button;
 }
 
-let openState = null; // { groupId, uid, modalEl, backdropEl }
+let openState = null; // { groupId, uid, modalEl, backdropEl, invites, unsubInvites }
 
 function closeModal() {
+  openState?.unsubInvites?.();
   openState?.backdropEl.remove();
   openState = null;
 }
@@ -232,6 +239,44 @@ function renderModal(group) {
     modalEl.appendChild(row);
   });
 
+  // Invitations en attente : les joueurs invités qui n'ont pas encore répondu — on peut les annuler.
+  const invitesBox = document.createElement('div');
+  invitesBox.className = 'gs-invites';
+  const invitesTitle = document.createElement('strong');
+  const invites = openState.invites || [];
+  invitesTitle.textContent = `Invitations en attente (${invites.length})`;
+  invitesBox.appendChild(invitesTitle);
+  if (invites.length === 0) {
+    const none = document.createElement('span');
+    none.style.cssText = 'display:block;color:#aaa;font-size:0.82rem';
+    none.textContent = 'Aucune invitation en attente. Utilise le « + » à côté des membres pour inviter des joueurs.';
+    invitesBox.appendChild(none);
+  }
+  invites.forEach((invite) => {
+    const row = document.createElement('div');
+    row.className = 'gs-invite-row';
+    const who = document.createElement('div');
+    who.className = 'gs-invite-name';
+    who.textContent = invite.toPseudo || 'Joueur';
+    const by = document.createElement('span');
+    by.textContent = invite.fromPseudo ? `invité par ${invite.fromPseudo}` : '';
+    who.appendChild(by);
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'secondary';
+    cancel.textContent = 'Annuler';
+    cancel.addEventListener('click', () => {
+      cancel.disabled = true;
+      cancelGroupInvite(invite.id).catch((error) => {
+        cancel.disabled = false;
+        errorEl.textContent = error.message || 'Impossible d\'annuler l\'invitation.';
+      });
+    });
+    row.append(who, cancel);
+    invitesBox.appendChild(row);
+  });
+  modalEl.appendChild(invitesBox);
+
   const match = document.createElement('div');
   match.className = 'gs-match';
   const status = document.createElement('strong');
@@ -282,7 +327,12 @@ export function openGroupSettings(group, uid) {
     if (event.target === backdropEl) closeModal();
   });
   document.body.appendChild(backdropEl);
-  openState = { groupId: group.id, uid, modalEl, backdropEl };
+  openState = { groupId: group.id, uid, modalEl, backdropEl, invites: [], unsubInvites: null, group };
+  openState.unsubInvites = listenGroupInvites(group.id, uid, (invites) => {
+    if (!openState || openState.groupId !== group.id) return;
+    openState.invites = invites;
+    renderModal(openState.group);
+  });
   renderModal(group);
 }
 
@@ -295,6 +345,7 @@ export function syncGroupSettings(groups) {
     closeModal();
     return;
   }
+  openState.group = group;
   // Pas de rafraîchissement pendant qu'on tape une valeur : la saisie serait effacée
   const focused = document.activeElement;
   if (focused instanceof HTMLInputElement && focused.type === 'number' && openState.modalEl.contains(focused)) return;
