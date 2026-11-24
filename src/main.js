@@ -413,6 +413,11 @@ applySettings();
 });
 
 let networkStarted = false;
+// Vrai tant qu'on est au lobby (ou sur l'écran de connexion) : empêche l'événement « unlock » du
+// pointeur de réafficher le menu de jeu par-dessus le lobby. Repasse à faux à l'entrée en jeu
+// (événement 'bg:enter-game' envoyé par lobby.js).
+let inLobby = true;
+window.addEventListener('bg:enter-game', () => { inLobby = false; });
 // Easter egg « salle de peinture » : null tant qu'il n'est pas lancé (et il ne l'est jamais
 // tant que PAINT_EGG.enabled vaut false). `mapScene` = la vraie carte, qu'on masque pendant l'easter egg.
 let paintRoom = null;
@@ -494,13 +499,14 @@ playButton.addEventListener('click', () => {
 // démonter à la main toute la scène 3D, les joueurs adverses, le HUD, etc.
 quitButton.addEventListener('click', () => {
   if (window.confirm('Quitter la partie et revenir au lobby ?')) {
-    window.location.reload();
+    leaveMatchToLobby({ reason: 'quit' });
   }
 });
 controls.addEventListener('lock', () => {
   menuEl.style.display = 'none';
 });
 controls.addEventListener('unlock', () => {
+  if (inLobby) return; // on vient de quitter la partie : le lobby est affiché, pas le menu de jeu
   // Si c'est la boutique qui vient de déverrouiller le pointeur (touche B),
   // on ne veut PAS afficher le menu "Cliquer pour jouer" par-dessus — voir
   // la section "Boutique" plus bas.
@@ -1308,12 +1314,88 @@ function handleAdminTeleport({ position }) {
   lastGroundY = position.y - STAND_EYE_HEIGHT;
 }
 
+// Retour au lobby SANS recharger la page (quitter, fin de partie éliminatoire, expulsion...) :
+// on coupe la connexion, on remet à zéro tout ce qui appartient à la partie (joueurs, butin,
+// grenades, zone, vie, arme, munitions, HUD...), puis lobby.js réaffiche le lobby ('bg:left-match').
+// Une nouvelle partie repart alors d'un état propre via startNetwork().
+function leaveMatchToLobby({ reason } = {}) {
+  inLobby = true;
+  clearInterval(respawnInterval);
+  respawnInterval = null;
+  disconnectFromServer();
+  networkStarted = false;
+
+  // Overlays ouverts
+  if (isShopOpen()) closeShop();
+  if (minimap.isOpen()) minimap.close();
+  minimap.clearPings();
+  if (gameAdminPanel.isOpen()) gameAdminPanel.close();
+
+  // Le monde de la partie : autres joueurs, butin, grenades, zone
+  Array.from(otherPlayers.keys()).forEach(removeOtherPlayer);
+  Array.from(groundVestMeshes.keys()).forEach(removeGroundVest);
+  Array.from(groundWeaponPickups.keys()).forEach(removeGroundWeaponPickup);
+  activeGrenades.forEach((g) => {
+    scene.remove(g.mesh);
+  });
+  activeGrenades.clear();
+  handleZoneUpdate({ enabled: false });
+
+  // Ton personnage : retour à l'état de départ
+  isDead = false;
+  localHp = MAX_HP;
+  updateHealthUI(MAX_HP);
+  updateShieldUI(0);
+  updateMoneyUI(0);
+  myMaxVestSlots = MAX_SHIELD_VESTS_BASE;
+  myVestCount = 0;
+  myGrenades = { frag: 0, smoke: 0 };
+  updateGrenadeUI();
+  myWeapons = [{ id: 'pistol', rarity: 'gray', ammo: WEAPON_DEFS.pistol.magSize }, null];
+  applyRarityTint('pistol', 'gray');
+  selectSlot(0, { silent: true });
+  cancelReload({ notify: false });
+  isSprinting = false;
+  endSlide();
+  isAiming = false;
+  isMouseDown = false;
+  isCrouching = false;
+  stamina = STAMINA_MAX;
+  sprintLocked = false;
+  bloom = 0;
+  verticalVelocity = 0;
+  velocity.set(0, 0, 0);
+  move.forward = false;
+  move.backward = false;
+  move.left = false;
+  move.right = false;
+  applyAdminState({ godmode: false, noclip: false, fly: false, invisible: false, infiniteAmmo: false, oneShot: false, frozen: false, speed: 1 });
+  setSpectatorVision(false);
+  ambiance.setPhaseOverride(null);
+  localTeam = null;
+
+  // HUD
+  weaponGroup.visible = true;
+  deathScreenEl.hidden = true;
+  hudFx.clear();
+  scoreboard.hide();
+  scoreboard.clearFeed();
+  scoreboard.setScores([]);
+  updateAmmoUI();
+  updateInventoryUI();
+  if (mapLoaded && collidersLoaded) loadingEl.style.display = 'none';
+
+  menuEl.style.display = 'none';
+  controls.unlock(); // l'événement « unlock » qui suit est ignoré (inLobby)
+  window.dispatchEvent(new CustomEvent('bg:left-match', { detail: { reason } }));
+}
+
 // Expulsé de la partie par un admin : on coupe et on retourne au lobby
 function handleAdminKicked({ reason } = {}) {
   disconnectFromServer();
   networkStarted = false;
   window.alert(`Tu as été expulsé de la partie par un administrateur.${reason ? `\nMotif : ${reason}` : ''}`);
-  window.location.reload();
+  leaveMatchToLobby({ reason: 'kicked' });
 }
 
 let respawnInterval = null;
@@ -2780,7 +2862,7 @@ async function startNetwork() {
     onZoneUpdate: handleZoneUpdate,
     onJoinDenied: ({ reason } = {}) => {
       window.alert(reason || 'Impossible de rejoindre la partie.');
-      window.location.reload();
+      leaveMatchToLobby({ reason: 'join-denied' });
     },
     onMatchOver: ({ winner } = {}) => {
       hudFx.showAnnouncement(winner ? `Partie terminée — victoire de ${winner} !` : 'Partie terminée — personne ne gagne.', null, false);
@@ -2792,7 +2874,7 @@ async function startNetwork() {
         deleted: 'Le groupe a été supprimé.',
       };
       hudFx.showAnnouncement(texts[reason] || 'La partie est terminée.', null, false);
-      setTimeout(() => window.location.reload(), 2500); // retour au lobby
+      setTimeout(() => { if (!inLobby) leaveMatchToLobby({ reason: 'match-ended' }); }, 2500); // retour au lobby, sans recharger (sauf si déjà parti)
     },
     onPlayerDied: ({ id }) => setOtherPlayerVisible(id, false),
     onYouRespawned: handleYouRespawned,

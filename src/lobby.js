@@ -8,7 +8,16 @@
 //   Apparence  — choix du skin
 //   Paramètres — touches personnalisables (voir keybinds.js)
 //   Compte     — pseudo, email, déconnexion
-import { onAuthChange, signUp, signIn, signOutUser, deleteAccountUser, friendlyAuthError } from './auth.js';
+import {
+  onAuthChange,
+  signUp,
+  signIn,
+  signOutUser,
+  deleteAccountUser,
+  friendlyAuthError,
+  fetchVerificationStatus,
+} from './auth.js';
+import { showVerifyScreen, hideVerifyScreen } from './verify-email.js';
 import {
   searchUserByPseudo,
   sendFriendRequest,
@@ -23,15 +32,24 @@ import {
   listenMyGroups,
   leaveGroup,
   deleteGroup,
-  sendGroupInvite,
   listenIncomingGroupInvites,
+  listenMySentGroupInvites,
   acceptGroupInvite,
   declineGroupInvite,
   setGroupMode,
   setMemberTeam,
   setGroupAdmin,
   removeMemberFromGroup,
+  BOT_LEVELS,
+  botAppearance,
+  botLevelLabel,
+  listGroupBots,
+  setBotLevel,
+  removeBotFromGroup,
 } from './groups.js';
+import { createAddMemberButton } from './group-add.js';
+import { initInGameChat } from './ingame-chat.js';
+import { notify, requestNotificationPermission, requestPermissionOnFirstClick } from './notifications.js';
 import {
   initAppearancePicker,
   getAppearance,
@@ -112,6 +130,11 @@ let unsubscribers = [];
 
 let pendingFriendRequestCount = 0;
 let pendingGroupInviteCount = 0;
+let mySentInvites = []; // invitations de groupe que j'ai envoyées (pour ne pas réinviter)
+// Pour ne notifier que les NOUVEAUTÉS (le premier instantané Firestore = l'existant, sans notif)
+let knownFriendRequestIds = null;
+let knownGroupInviteIds = null;
+const lastMatchRunning = new Map(); // groupId -> la partie tournait-elle au dernier instantané
 
 // Skins des autres membres du groupe actif (uid -> apparence), alimentés par
 // un abonnement à leur profil public — voir profiles.js. Le tien vient
@@ -132,12 +155,26 @@ initAppearancePicker({
 });
 
 // Pastille sur "Messages" : nombre de conversations avec un message non lu.
+// Messagerie en partie : bouton « Messages » du menu Échap (voir ingame-chat.js)
+let inGameChat = null;
 initMessaging({
   onUnreadChange: (count) => {
     messagesBadge.hidden = count === 0;
     messagesBadge.textContent = String(count);
+    inGameChat?.setUnread(count);
+  },
+  // Nouveau message d'un autre : notification système (fenêtre en arrière-plan) ou alerte à l'écran (en partie)
+  onIncomingMessage: ({ convId, kind, title, from, text }) => {
+    notify({
+      title: kind === 'group' ? `${from} · ${title}` : from,
+      body: text,
+      tag: `msg:${convId}`,
+      toast: true,
+    });
   },
 });
+inGameChat = initInGameChat({ setMessagesVisible: setMessagesTabVisible });
+requestPermissionOnFirstClick();
 
 function clearSubscriptions() {
   setMessagingUser(null);
@@ -150,6 +187,10 @@ function clearSubscriptions() {
 
   currentFriends = [];
   currentGroups = [];
+  mySentInvites = [];
+  knownFriendRequestIds = null;
+  knownGroupInviteIds = null;
+  lastMatchRunning.clear();
   pendingFriendRequestCount = 0;
   pendingGroupInviteCount = 0;
   updateFriendsBadge();
@@ -184,6 +225,9 @@ initKeybindsPicker({ onChange: updateMenuHelp });
 // l'utilisateur (le clic sur le curseur) suffit à débloquer l'audio du
 // navigateur.
 initSettingsPicker({
+  onChange: (settings) => {
+    if (settings.desktopNotifications) requestNotificationPermission();
+  },
   onVolumeCommit: (settings) => {
     audio.unlock();
     audio.setVolume(settings.volume);
@@ -205,10 +249,19 @@ function showLobbyScreen() {
 }
 
 function showGameScreen() {
+  window.dispatchEvent(new Event('bg:enter-game')); // main.js : on est en jeu (le menu de jeu peut s'afficher)
   lobbyScreen.hidden = true;
   updateMenuHelp();
   menuEl.style.display = 'flex';
 }
+
+// Retour de partie (quitter, fin éliminatoire, expulsion...) : on réaffiche le lobby sans recharger la page
+window.addEventListener('bg:left-match', () => {
+  inGameChat?.close();
+  if (!currentUser) return;
+  showLobbyScreen();
+  updateEnterButton(getActiveGroup());
+});
 
 function emptyItem(text) {
   const li = document.createElement('li');
@@ -343,7 +396,14 @@ function getPartyMembers() {
       appearance: memberAppearances.get(uid) || DEFAULT_APPEARANCE,
       team: teamOf(uid),
     }));
-  return [me, ...others];
+  const bots = listGroupBots(group).map((bot) => ({
+    uid: bot.key,
+    pseudo: `Bot ${bot.name}`,
+    appearance: botAppearance(bot.level),
+    team: teamOf(bot.key),
+    isBot: true,
+  }));
+  return [me, ...others, ...bots];
 }
 
 function renderHomeParty() {
@@ -516,6 +576,12 @@ function renderIncomingRequests(requests) {
   if (!currentUser) return;
   pendingFriendRequestCount = requests.length;
   updateFriendsBadge();
+  if (knownFriendRequestIds) {
+    requests
+      .filter((r) => !knownFriendRequestIds.has(r.id))
+      .forEach((r) => notify({ title: 'Demande d\'ami', body: `${r.fromPseudo} veut devenir ton ami.`, tag: `fr:${r.id}` }));
+  }
+  knownFriendRequestIds = new Set(requests.map((r) => r.id));
 
   friendRequestsList.innerHTML = '';
   if (requests.length === 0) {
@@ -590,6 +656,14 @@ function renderIncomingGroupInvites(invites) {
   if (!currentUser) return;
   pendingGroupInviteCount = invites.length;
   updateFriendsBadge();
+  if (knownGroupInviteIds) {
+    invites
+      .filter((i) => !knownGroupInviteIds.has(i.id))
+      .forEach((i) =>
+        notify({ title: 'Invitation de groupe', body: `${i.fromPseudo} t'invite à rejoindre « ${i.groupName} ».`, tag: `gi:${i.id}` })
+      );
+  }
+  knownGroupInviteIds = new Set(invites.map((i) => i.id));
 
   groupInvitesList.innerHTML = '';
   if (invites.length === 0) {
@@ -728,6 +802,100 @@ function buildMemberCard(uid, pseudo, group, isOwner) {
   return card;
 }
 
+// Un bot du groupe : même rond qu'un membre (couleur selon le niveau) + étiquette « BOT · niveau ».
+// Le créateur / l'admin clique dessus pour changer son niveau, son équipe ou le retirer.
+function buildBotCard(bot, group, canManage) {
+  const menuKey = `${group.id}:${bot.key}`;
+  const menuOpen = openMemberMenuKey === menuKey;
+  const card = document.createElement('div');
+  card.className = 'member-card';
+  card.classList.toggle('member-card-menu-open', menuOpen);
+
+  const avatarButton = document.createElement('button');
+  avatarButton.type = 'button';
+  avatarButton.className = 'member-avatar-button';
+  avatarButton.title = canManage ? `Options de Bot ${bot.name}` : `Bot ${bot.name}`;
+  const avatar = document.createElement('div');
+  avatar.className = 'member-avatar';
+  fillMemberAvatar(avatar, botAppearance(bot.level));
+  if (group.mode === 'team') {
+    const team = group.memberTeams?.[bot.key] || null;
+    ['red', 'blue', 'yellow', 'green'].forEach((t) => avatar.classList.toggle(`team-${t}`, team === t));
+  }
+  avatarButton.appendChild(avatar);
+  avatarButton.addEventListener('click', () => {
+    if (!canManage) return;
+    openMemberMenuKey = menuOpen ? null : menuKey;
+    renderGroupsList();
+  });
+  card.appendChild(avatarButton);
+
+  const name = document.createElement('div');
+  name.className = 'member-name';
+  name.textContent = bot.name;
+  card.appendChild(name);
+  const label = document.createElement('span');
+  label.className = 'member-bot-label';
+  label.textContent = `BOT · ${botLevelLabel(bot.level)}`;
+  card.appendChild(label);
+
+  if (menuOpen && canManage) {
+    const menu = document.createElement('div');
+    menu.className = 'member-action-menu';
+    menu.style.flexDirection = 'column';
+    menu.style.top = '-62px';
+
+    if (group.mode === 'team') {
+      const teamRow = document.createElement('div');
+      teamRow.className = 'member-team-picker';
+      ['red', 'blue', 'yellow', 'green'].forEach((team) => {
+        const dot = document.createElement('button');
+        dot.type = 'button';
+        dot.className = `team-dot team-dot-${team}`;
+        dot.classList.toggle('selected', group.memberTeams?.[bot.key] === team);
+        dot.title = ({ red: 'Équipe rouge', blue: 'Équipe bleue', yellow: 'Équipe jaune', green: 'Équipe verte' })[team];
+        dot.addEventListener('click', (event) => {
+          event.stopPropagation();
+          setMemberTeam(group.id, bot.key, team).catch((error) => { lobbyError.textContent = error.message; });
+          openMemberMenuKey = null;
+        });
+        teamRow.appendChild(dot);
+      });
+      menu.appendChild(teamRow);
+    }
+
+    const levelRow = document.createElement('div');
+    levelRow.className = 'bot-level-picker';
+    BOT_LEVELS.forEach((level) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `bot-level-btn${bot.level === level.id ? ' selected' : ''}`;
+      button.textContent = level.label;
+      button.addEventListener('click', (event) => {
+        event.stopPropagation();
+        setBotLevel(group.id, bot.key, level.id).catch((error) => { lobbyError.textContent = error.message; });
+        openMemberMenuKey = null;
+      });
+      levelRow.appendChild(button);
+    });
+    menu.appendChild(levelRow);
+
+    const removeButton = document.createElement('button');
+    removeButton.type = 'button';
+    removeButton.className = 'remove-member-dot';
+    removeButton.textContent = '✕';
+    removeButton.title = `Retirer Bot ${bot.name} du groupe`;
+    removeButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      openMemberMenuKey = null;
+      removeBotFromGroup(group.id, bot.key).catch((error) => { lobbyError.textContent = error.message; });
+    });
+    menu.appendChild(removeButton);
+    card.appendChild(menu);
+  }
+  return card;
+}
+
 // Liste de gestion des groupes (onglet Amis) : c'est ici qu'on crée, invite,
 // quitte ou supprime. L'accueil, lui, n'affiche pas de nom de groupe mais
 // directement les persos des membres.
@@ -785,41 +953,29 @@ function renderGroupsList() {
     group.members.forEach((uid) => {
       membersRow.appendChild(buildMemberCard(uid, group.memberPseudos?.[uid], group, isOwner));
     });
+    // Bots du groupe, puis le rond « + » (ajouter un bot ou inviter des joueurs).
+    const manager = canManageGroup(group, currentUser.uid);
+    listGroupBots(group).forEach((bot) => {
+      membersRow.appendChild(buildBotCard(bot, group, manager));
+    });
+    membersRow.appendChild(
+      createAddMemberButton(() => {
+        const fresh = currentGroups.find((g) => g.id === group.id) || group;
+        return {
+          group: fresh,
+          canManage: canManageGroup(fresh, currentUser.uid),
+          friends: currentFriends,
+          pendingInviteUids: new Set(
+            mySentInvites.filter((i) => i.groupId === fresh.id).map((i) => i.toUid)
+          ),
+          me: { uid: currentUser.uid, pseudo: currentUser.displayName || currentUser.email },
+        };
+      })
+    );
     li.appendChild(membersRow);
 
     const actions = document.createElement('div');
     actions.className = 'group-actions';
-
-    const friendsNotInGroup = currentFriends.filter((f) => !group.members.includes(f.uid));
-    if (friendsNotInGroup.length > 0) {
-      const select = document.createElement('select');
-      const placeholder = document.createElement('option');
-      placeholder.value = '';
-      placeholder.textContent = 'Inviter un ami…';
-      select.appendChild(placeholder);
-      friendsNotInGroup.forEach((f) => {
-        const option = document.createElement('option');
-        option.value = f.uid;
-        option.textContent = f.pseudo;
-        select.appendChild(option);
-      });
-      select.addEventListener('change', () => {
-        if (!select.value || !currentUser) return;
-        const friend = friendsNotInGroup.find((f) => f.uid === select.value);
-        sendGroupInvite(
-          group.id,
-          group.name,
-          currentUser.uid,
-          currentUser.displayName,
-          friend.uid,
-          friend.pseudo
-        ).catch((error) => {
-          lobbyError.textContent = error.message;
-        });
-        select.value = '';
-      });
-      actions.appendChild(select);
-    }
 
     const leaveButton = document.createElement('button');
     leaveButton.className = 'secondary';
@@ -841,6 +997,14 @@ function renderGroupsList() {
 
 function renderGroups(groups) {
   if (!currentUser) return;
+  // Partie lancée dans un de mes groupes pendant que j'attends dans le lobby (sinon c'est moi qui l'ai lancée)
+  groups.forEach((g) => {
+    const running = isMatchRunning(g);
+    if (lastMatchRunning.has(g.id) && !lastMatchRunning.get(g.id) && running && !lobbyScreen.hidden) {
+      notify({ title: 'Partie lancée', body: `La partie du groupe « ${g.name} » vient de commencer.`, tag: `match:${g.id}` });
+    }
+    lastMatchRunning.set(g.id, running);
+  });
   currentGroups = groups;
   syncGroupSettings(groups);
   setMessagingGroups(groups);
@@ -849,21 +1013,37 @@ function renderGroups(groups) {
   renderHomeParty();
 }
 
-// --- État d'authentification -------------------------------------------------
-onAuthChange((user) => {
-  clearSubscriptions();
-  adminStatusUnsub?.();
-  adminStatusUnsub = null;
-  currentUser = user;
-  accountAdminPanel.setUser(user ? { uid: user.uid, pseudo: user.displayName || user.email || 'Joueur' } : null);
-  if (user) adminStatusUnsub = listenIsAdmin(user.uid, (value) => accountAdminPanel.setAdmin(value));
-  else accountAdminPanel.setAdmin(false);
+// --- Vérification du compte (code par mail) puis démarrage du lobby -----------------
+let authTicket = 0; // invalide les vérifications en cours si l'état de connexion change entre-temps
 
-  if (!user) {
-    showAuthScreen();
-    return;
+async function enterSession(user, ticket) {
+  try {
+    const verified = await fetchVerificationStatus();
+    if (ticket !== authTicket) return;
+    if (verified) {
+      hideVerifyScreen();
+      startLobbySession(user);
+      return;
+    }
+    showVerifyScreen({
+      user,
+      onVerified: () => {
+        if (ticket === authTicket) startLobbySession(user);
+      },
+      onSignOut: signOutUser,
+    });
+  } catch (error) {
+    if (ticket !== authTicket) return;
+    showVerifyScreen({
+      user,
+      statusError: error.message || 'Impossible de vérifier ton compte.',
+      onRetry: () => enterSession(user, ticket),
+      onSignOut: signOutUser,
+    });
   }
+}
 
+function startLobbySession(user) {
   lobbyPseudoEl.textContent = user.displayName || user.email;
   lobbyEmailEl.textContent = user.email || '';
   showLobbyScreen();
@@ -880,4 +1060,32 @@ onAuthChange((user) => {
   unsubscribers.push(listenFriends(user.uid, renderFriends));
   unsubscribers.push(listenMyGroups(user.uid, renderGroups));
   unsubscribers.push(listenIncomingGroupInvites(user.uid, renderIncomingGroupInvites));
+  unsubscribers.push(
+    listenMySentGroupInvites(user.uid, (invites) => {
+      mySentInvites = invites;
+    })
+  );
+}
+
+// --- État d'authentification -------------------------------------------------
+onAuthChange((user) => {
+  clearSubscriptions();
+  adminStatusUnsub?.();
+  adminStatusUnsub = null;
+  currentUser = user;
+  accountAdminPanel.setUser(user ? { uid: user.uid, pseudo: user.displayName || user.email || 'Joueur' } : null);
+  if (user) adminStatusUnsub = listenIsAdmin(user.uid, (value) => accountAdminPanel.setAdmin(value));
+  else accountAdminPanel.setAdmin(false);
+
+  if (!user) {
+    authTicket += 1;
+    hideVerifyScreen();
+    showAuthScreen();
+    return;
+  }
+
+  // Compte créé après la mise en place du code par mail : tant qu'il n'est pas vérifié, ni lobby
+  // ni abonnements (le serveur refuse de toute façon le jeu aux comptes non vérifiés).
+  const ticket = ++authTicket;
+  enterSession(user, ticket);
 });

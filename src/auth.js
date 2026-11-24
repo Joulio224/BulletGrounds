@@ -105,3 +105,58 @@ export function friendlyAuthError(error) {
   };
   return map[error.code] || error.message;
 }
+
+// --- Vérification du compte par code reçu par mail ---------------------------------
+// Tout se passe avec le serveur de jeu (mini-warzone-server, voir email-verification.js) :
+// c'est lui qui génère le code, l'envoie et décide si le compte est vérifié. Le jeu refuse de
+// toute façon les comptes non vérifiés côté serveur, cet écran n'est que la partie visible.
+function serverBase() {
+  return (import.meta.env.VITE_REALTIME_SERVER_URL || 'http://localhost:3001').replace(/\/$/, '');
+}
+
+async function authedRequest(path, { method = 'GET', body } = {}) {
+  const user = auth.currentUser;
+  if (!user) throw new Error('Aucun compte connecté.');
+  const token = await user.getIdToken();
+  let response;
+  try {
+    response = await fetch(`${serverBase()}${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    throw new Error('Serveur injoignable. Vérifie ta connexion puis réessaie.');
+  }
+  let data = {};
+  try { data = await response.json(); } catch { /* corps vide */ }
+  if (!response.ok) {
+    const error = new Error(data.error || 'Erreur du serveur.');
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+export async function fetchVerificationStatus() {
+  const data = await authedRequest('/auth/status');
+  return data.verified === true;
+}
+
+export function requestVerificationCode() {
+  return authedRequest('/auth/send-code', { method: 'POST' });
+}
+
+export async function submitVerificationCode(code) {
+  await authedRequest('/auth/verify-code', { method: 'POST', body: { code } });
+  await auth.currentUser?.getIdToken(true); // jeton rafraîchi : il porte maintenant le claim « vérifié »
+}
+
+// Mauvaise adresse e-mail à l'inscription : on supprime le compte NON vérifié pour recommencer.
+export async function cancelUnverifiedSignup() {
+  await authedRequest('/auth/cancel-signup', { method: 'POST' });
+  await signOut(auth).catch(() => {});
+}
