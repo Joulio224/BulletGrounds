@@ -10,14 +10,15 @@
 //   Compte     — pseudo, email, déconnexion
 import {
   onAuthChange,
-  signUp,
   signIn,
   signOutUser,
   deleteAccountUser,
   friendlyAuthError,
-  fetchVerificationStatus,
+  checkSignupForm,
+  requestSignupCode,
+  createVerifiedAccount,
 } from './auth.js';
-import { showVerifyScreen, hideVerifyScreen } from './verify-email.js';
+import { showSignupCodeScreen, hideVerifyScreen } from './verify-email.js';
 import {
   searchUserByPseudo,
   sendFriendRequest,
@@ -328,12 +329,19 @@ signupForm.addEventListener('submit', async (e) => {
     authError.textContent = 'Tu dois accepter les conditions d\'utilisation et confirmer ton âge pour créer un compte.';
     return;
   }
+  // Inscription en deux temps : un code est envoyé par mail, et le compte n'est créé qu'une fois
+  // le bon code saisi (voir auth.js). Sans inscription, aucun code n'est envoyé.
+  const email = document.getElementById('signup-email').value;
+  const password = document.getElementById('signup-password').value;
+  const pseudo = document.getElementById('signup-pseudo').value;
   try {
-    await signUp(
-      document.getElementById('signup-email').value,
-      document.getElementById('signup-password').value,
-      document.getElementById('signup-pseudo').value
-    );
+    checkSignupForm(email, password, pseudo);
+    await requestSignupCode(email);
+    showSignupCodeScreen({
+      email: email.trim(),
+      onSubmit: (code) => createVerifiedAccount({ email, password, pseudo, code }),
+      onResend: () => requestSignupCode(email),
+    });
   } catch (error) {
     authError.textContent = friendlyAuthError(error);
   }
@@ -1013,36 +1021,7 @@ function renderGroups(groups) {
   renderHomeParty();
 }
 
-// --- Vérification du compte (code par mail) puis démarrage du lobby -----------------
-let authTicket = 0; // invalide les vérifications en cours si l'état de connexion change entre-temps
-
-async function enterSession(user, ticket) {
-  try {
-    const verified = await fetchVerificationStatus();
-    if (ticket !== authTicket) return;
-    if (verified) {
-      hideVerifyScreen();
-      startLobbySession(user);
-      return;
-    }
-    showVerifyScreen({
-      user,
-      onVerified: () => {
-        if (ticket === authTicket) startLobbySession(user);
-      },
-      onSignOut: signOutUser,
-    });
-  } catch (error) {
-    if (ticket !== authTicket) return;
-    showVerifyScreen({
-      user,
-      statusError: error.message || 'Impossible de vérifier ton compte.',
-      onRetry: () => enterSession(user, ticket),
-      onSignOut: signOutUser,
-    });
-  }
-}
-
+// --- Démarrage du lobby une fois connecté ------------------------------------------
 function startLobbySession(user) {
   lobbyPseudoEl.textContent = user.displayName || user.email;
   lobbyEmailEl.textContent = user.email || '';
@@ -1078,14 +1057,10 @@ onAuthChange((user) => {
   else accountAdminPanel.setAdmin(false);
 
   if (!user) {
-    authTicket += 1;
     hideVerifyScreen();
     showAuthScreen();
     return;
   }
 
-  // Compte créé après la mise en place du code par mail : tant qu'il n'est pas vérifié, ni lobby
-  // ni abonnements (le serveur refuse de toute façon le jeu aux comptes non vérifiés).
-  const ticket = ++authTicket;
-  enterSession(user, ticket);
+  startLobbySession(user);
 });

@@ -1,11 +1,9 @@
 // ---------------------------------------------------------------------------
-// Écran « Vérifie ton adresse e-mail » (code à 6 chiffres reçu par mail)
+// Écran « Saisis le code reçu par mail » (étape 2 de l'inscription)
 // ---------------------------------------------------------------------------
-// Affiché par lobby.js tant que le serveur dit que le compte n'est pas vérifié. Il recouvre
-// l'écran de connexion et le lobby. Voir auth.js (appels serveur) et email-verification.js
-// côté serveur (génération, envoi, limites d'essais).
-import { requestVerificationCode, submitVerificationCode, cancelUnverifiedSignup } from './auth.js';
-
+// Affiché par lobby.js APRÈS que le serveur a envoyé le code, et AVANT la création du compte :
+// tant que le bon code n'est pas saisi, aucun compte n'existe. Voir auth.js (requestSignupCode /
+// createVerifiedAccount) et signup-verification.js côté serveur.
 const RESEND_SECONDS = 60;
 let root = null;
 let countdownTimer = null;
@@ -17,7 +15,7 @@ function injectStyle() {
   style.textContent = `
     #verify-screen {
       position: fixed; inset: 0; z-index: 2000; display: flex; align-items: center; justify-content: center;
-      background: #0f1015; padding: 16px; box-sizing: border-box; color: #eee; font: 15px/1.5 system-ui, sans-serif;
+      background: rgba(8, 10, 16, 0.92); padding: 16px; box-sizing: border-box; color: #eee; font: 15px/1.5 system-ui, sans-serif;
     }
     #verify-screen .vf-box {
       width: min(380px, 100%); box-sizing: border-box; padding: 24px; border-radius: 14px;
@@ -54,9 +52,11 @@ function el(tag, className, text) {
   return node;
 }
 
-// options : { user, onVerified, onSignOut, statusError?, onRetry? }
-//   statusError : le serveur n'a pas pu dire si le compte est vérifié -> écran d'erreur avec « Réessayer »
-export function showVerifyScreen({ user, onVerified, onSignOut, statusError = null, onRetry = null }) {
+// options : { email, onSubmit(code), onResend() }
+//   onSubmit : crée le compte avec ce code (rejette avec un message si le code est refusé)
+//   onResend : redemande un code au serveur
+// « Modifier mon inscription » referme l'écran : rien n'a été créé, le formulaire est intact.
+export function showSignupCodeScreen({ email, onSubmit, onResend }) {
   injectStyle();
   hideVerifyScreen();
   root = el('div');
@@ -65,35 +65,11 @@ export function showVerifyScreen({ user, onVerified, onSignOut, statusError = nu
   root.appendChild(box);
   document.body.appendChild(root);
 
-  const msg = el('p', 'vf-msg');
-  const setMsg = (text, kind = '') => {
-    msg.textContent = text;
-    msg.className = `vf-msg ${kind}`;
-  };
-  const signOutButton = el('button', 'vf-link', 'Se déconnecter');
-  signOutButton.type = 'button';
-  signOutButton.addEventListener('click', () => {
-    hideVerifyScreen();
-    onSignOut?.();
-  });
-
-  if (statusError) {
-    box.append(el('h2', '', 'Connexion au serveur impossible'), el('p', '', statusError), msg);
-    const row = el('div', 'vf-row');
-    const retry = el('button', '', 'Réessayer');
-    retry.type = 'button';
-    retry.addEventListener('click', () => {
-      hideVerifyScreen();
-      onRetry?.();
-    });
-    row.append(retry, signOutButton);
-    box.appendChild(row);
-    return;
-  }
-
-  box.append(el('h2', '', 'Vérifie ton adresse e-mail'));
+  box.appendChild(el('h2', '', 'Vérifie ton adresse e-mail'));
   const intro = el('p');
-  intro.append('Un code à 6 chiffres a été envoyé à ', Object.assign(el('strong'), { textContent: user.email || 'ton adresse' }), '. Regarde aussi dans les courriers indésirables.');
+  const strong = el('strong');
+  strong.textContent = email;
+  intro.append('Un code à 6 chiffres vient d’être envoyé à ', strong, '. Ton compte sera créé quand tu l’auras saisi. Regarde aussi dans les courriers indésirables.');
   box.appendChild(intro);
 
   const input = document.createElement('input');
@@ -104,17 +80,23 @@ export function showVerifyScreen({ user, onVerified, onSignOut, statusError = nu
   input.placeholder = '••••••';
   input.setAttribute('aria-label', 'Code de vérification');
   box.appendChild(input);
+
+  const msg = el('p', 'vf-msg');
+  const setMsg = (text, kind = '') => {
+    msg.textContent = text;
+    msg.className = `vf-msg ${kind}`;
+  };
   box.appendChild(msg);
 
-  const submit = el('button', '', 'Valider');
+  const submit = el('button', '', 'Créer mon compte');
   submit.type = 'button';
   submit.disabled = true;
   const resend = el('button', 'vf-link', 'Renvoyer le code');
   resend.type = 'button';
-  const wrongAddress = el('button', 'vf-link', 'Mauvaise adresse ? Recommencer l’inscription');
-  wrongAddress.type = 'button';
+  const back = el('button', 'vf-link', 'Modifier mon inscription');
+  back.type = 'button';
   const row = el('div', 'vf-row');
-  row.append(submit, resend, wrongAddress, signOutButton);
+  row.append(submit, resend, back);
   box.appendChild(row);
 
   function startCountdown(seconds = RESEND_SECONDS) {
@@ -135,24 +117,6 @@ export function showVerifyScreen({ user, onVerified, onSignOut, statusError = nu
     countdownTimer = setInterval(tick, 1000);
   }
 
-  async function sendCode({ automatic = false } = {}) {
-    resend.disabled = true;
-    try {
-      await requestVerificationCode();
-      setMsg('Code envoyé.', 'ok');
-      startCountdown();
-    } catch (error) {
-      if (automatic && error.status === 429) {
-        // Un code vient déjà d'être envoyé (reconnexion rapide) : rien d'inquiétant
-        setMsg('Un code t’a déjà été envoyé récemment.', 'ok');
-        startCountdown(30);
-      } else {
-        setMsg(error.message, 'err');
-        resend.disabled = false;
-      }
-    }
-  }
-
   input.addEventListener('input', () => {
     input.value = input.value.replace(/\D/g, '').slice(0, 6);
     submit.disabled = input.value.length !== 6;
@@ -162,30 +126,29 @@ export function showVerifyScreen({ user, onVerified, onSignOut, statusError = nu
   });
   submit.addEventListener('click', async () => {
     submit.disabled = true;
-    setMsg('Vérification…');
+    setMsg('Création du compte…');
     try {
-      await submitVerificationCode(input.value);
-      hideVerifyScreen();
-      onVerified?.();
+      await onSubmit(input.value);
+      hideVerifyScreen(); // la connexion qui suit ouvre le lobby (lobby.js, onAuthChange)
     } catch (error) {
-      setMsg(error.message, 'err');
+      setMsg(error.message || 'Impossible de créer le compte.', 'err');
       input.select();
       submit.disabled = input.value.length !== 6;
     }
   });
-  resend.addEventListener('click', () => sendCode());
-  wrongAddress.addEventListener('click', async () => {
-    if (!window.confirm('Supprimer ce compte non vérifié pour recommencer avec la bonne adresse ?')) return;
-    wrongAddress.disabled = true;
+  resend.addEventListener('click', async () => {
+    resend.disabled = true;
     try {
-      await cancelUnverifiedSignup(); // déconnecte aussi : lobby.js revient à l'écran de connexion
-      hideVerifyScreen();
+      await onResend();
+      setMsg('Nouveau code envoyé.', 'ok');
+      startCountdown();
     } catch (error) {
       setMsg(error.message, 'err');
-      wrongAddress.disabled = false;
+      resend.disabled = false;
     }
   });
+  back.addEventListener('click', hideVerifyScreen);
 
+  startCountdown();
   input.focus();
-  sendCode({ automatic: true });
 }

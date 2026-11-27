@@ -116,6 +116,7 @@ export function notify({ title, body, tag, toast = false }) {
     try {
       const n = new Notification(cleanTitle, { body: cleanBody, tag, silent: false });
       n.onclick = () => {
+        window.bgDesktop?.showWindow?.(); // appli de bureau : rouvre la fenêtre si elle est cachée
         window.focus();
         n.close();
       };

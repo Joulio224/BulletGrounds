@@ -67,8 +67,9 @@ service cloud.firestore {
       // Le champ "admin" (voir admin.js) ne peut PAS être posé ou modifié par
       // le joueur lui-même, sinon n'importe qui se ferait admin : il se pose
       // uniquement à la main dans la console Firebase.
-      allow create: if request.auth != null && request.auth.uid == uid &&
-        !('admin' in request.resource.data);
+      // Le profil est créé UNIQUEMENT par le serveur de jeu, à l'inscription, une fois le code reçu
+      // par mail validé (signup-verification.js) : un client ne peut pas s'en créer un tout seul.
+      allow create: if false;
       allow update: if request.auth != null && request.auth.uid == uid &&
         !request.resource.data.diff(resource.data).affectedKeys().hasAny(['admin']);
       allow delete: if false;

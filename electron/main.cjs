@@ -1,5 +1,4 @@
-
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { autoUpdater } = require('electron-updater');
@@ -10,6 +9,86 @@ autoUpdater.autoRunAppAfterInstall = true;
 
 let mainWindow = null;
 let updateWindow = null;
+let tray = null;
+let isQuitting = false;
+
+// Lancé par Windows au démarrage de la session (--hidden) : on reste dans la zone de notification
+const startHidden = process.argv.includes('--hidden');
+
+// Un seul BulletGrounds à la fois : relancer l'appli alors qu'elle tourne en arrière-plan
+// rouvre simplement la fenêtre existante.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) app.quit();
+
+// Réglages propres à l'appli de bureau (pas ceux du jeu)
+const prefsFile = () => path.join(app.getPath('userData'), 'desktop-prefs.json');
+function readPrefs() {
+  try {
+    return { background: true, hintShown: false, ...JSON.parse(fs.readFileSync(prefsFile(), 'utf8')) };
+  } catch {
+    return { background: true, hintShown: false };
+  }
+}
+function writePrefs(patch) {
+  try {
+    fs.writeFileSync(prefsFile(), JSON.stringify({ ...readPrefs(), ...patch }));
+  } catch {}
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+// Icône + menu de la zone de notification (à côté de l'horloge)
+async function createTray() {
+  if (tray) return;
+  let icon = nativeImage.createEmpty();
+  try {
+    icon = await app.getFileIcon(process.execPath, { size: 'small' });
+  } catch {}
+  tray = new Tray(icon);
+  tray.setToolTip('BulletGrounds');
+  const rebuildMenu = () => {
+    const prefs = readPrefs();
+    tray.setContextMenu(
+      Menu.buildFromTemplate([
+        { label: 'Ouvrir BulletGrounds', click: showMainWindow },
+        { type: 'separator' },
+        {
+          label: 'Rester actif en arrière-plan (notifications)',
+          type: 'checkbox',
+          checked: prefs.background,
+          click: (item) => {
+            writePrefs({ background: item.checked });
+            rebuildMenu();
+          },
+        },
+        {
+          label: 'Lancer au démarrage de Windows',
+          type: 'checkbox',
+          checked: app.getLoginItemSettings().openAtLogin,
+          click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked, args: ['--hidden'] }),
+        },
+        { type: 'separator' },
+        {
+          label: 'Quitter BulletGrounds',
+          click: () => {
+            isQuitting = true;
+            app.quit();
+          },
+        },
+      ])
+    );
+  };
+  rebuildMenu();
+  tray.on('click', showMainWindow);
+}
 
 function log(message) {
   try {
@@ -29,8 +108,8 @@ function createUpdateWindow() {
     maximizable: false,
     closable: false,
     alwaysOnTop: true,
-    parent: mainWindow || undefined,
-    modal: Boolean(mainWindow),
+    parent: mainWindow && mainWindow.isVisible() ? mainWindow : undefined,
+    modal: Boolean(mainWindow && mainWindow.isVisible()),
     frame: false,
     backgroundColor: '#080d18',
     webPreferences: {
@@ -116,11 +195,32 @@ function createWindow() {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      // Le script de pont (preload) laisse une notification cliquée rouvrir la fenêtre cachée
+      preload: path.join(__dirname, 'preload.cjs'),
+      // Fenêtre cachée : on garde la page active pour continuer à recevoir les notifications
+      backgroundThrottling: false
     }
   });
 
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  mainWindow.once('ready-to-show', () => {
+    if (!startHidden) mainWindow.show();
+  });
+
+  // Fermer la fenêtre ne quitte plus le jeu : il reste dans la zone de notification pour
+  // continuer à envoyer les notifications (désactivable dans le menu de l'icône).
+  mainWindow.on('close', (event) => {
+    if (isQuitting || !readPrefs().background) return;
+    event.preventDefault();
+    mainWindow.hide();
+    if (!readPrefs().hintShown) {
+      writePrefs({ hintShown: true });
+      tray?.displayBalloon?.({
+        title: 'BulletGrounds reste actif',
+        content: 'Tu recevras tes notifications en arrière-plan. Clic droit sur l’icône pour quitter.',
+      });
+    }
+  });
 
   if (app.isPackaged) {
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
@@ -185,17 +285,39 @@ function checkForUpdates() {
   });
 }
 
-app.whenReady().then(() => {
-  createWindow();
-  setTimeout(checkForUpdates, 2500);
+// Windows associe les notifications à l'identifiant de l'appli (sauf version Microsoft Store,
+// qui a déjà le sien).
+if (process.platform === 'win32' && !process.windowsStore) {
+  app.setAppUserModelId('fr.miniwarzone.game');
+}
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    }
-  });
+app.on('second-instance', showMainWindow);
+
+// Clic sur une notification : le jeu (page) demande à rouvrir sa fenêtre
+ipcMain.on('bg:show-window', showMainWindow);
+
+app.on('before-quit', () => {
+  isQuitting = true; // quitter pour de bon (menu de l'icône, mise à jour, arrêt de Windows)
+});
+autoUpdater.on('before-quit-for-update', () => {
+  isQuitting = true;
 });
 
+if (gotSingleInstanceLock) {
+  app.whenReady().then(() => {
+    createWindow();
+    createTray();
+    setTimeout(checkForUpdates, 2500);
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+      }
+    });
+  });
+}
+
 app.on('window-all-closed', () => {
+  // Avec « rester actif », la fenêtre est seulement cachée : cet événement n'arrive alors pas.
   if (process.platform !== 'darwin') app.quit();
 });
